@@ -62,7 +62,7 @@ def get_articles_from_xlsx(xlsx_path, log):
     for r in range(1, 9):
         for c in range(1, 5):
             v = ws.cell(r, c).value
-            if v and ('Artikel' in str(v) or 'Article' in str(v)):
+            if v and any(k in str(v) for k in ('Artikel', 'Article', 'Артикул')):
                 art_col, hdr_row = c, r; break
         if art_col: break
     if art_col is None:
@@ -87,7 +87,7 @@ def get_xlsx_items_data(xlsx_path, log):
     for r in range(1, 9):
         for c in range(1, 5):
             v = ws.cell(r, c).value
-            if v and ('Artikel' in str(v) or 'Article' in str(v)):
+            if v and any(k in str(v) for k in ('Artikel', 'Article', 'Артикул')):
                 art_col, hdr_row = c, r; break
         if art_col: break
     if art_col is None: return []
@@ -361,11 +361,18 @@ def process_docx(src, dst, params, spec_arts, log):
             break
 
     # ── 8. CLEAR FOOTER REFERENCE ─────────────────────────────────────────────
+    cleared = False
     for p in doc.paragraphs:
-        if re.search(r'\b109\d{4}', _txt(p)):
+        if re.search(r'\b10\d{5}\b', _txt(p)):
             for run in p.runs: run.text = ''
-            log('  ✓ Сноска очищена')
-            break
+            cleared = True
+    for p in list(doc.paragraphs):
+        t = _txt(p).strip()
+        if t and re.fullmatch(r'[\d\s\u00a0]+', t):
+            p._element.getparent().remove(p._element)
+            cleared = True
+    if cleared:
+        log('  ✓ Сноска / хвостовые номера очищены')
 
     # ── Fix price format: 4 decimal → 2 decimal in Cell[4] ─────────────────────
     for row in doc.tables[0].rows[1:]:
@@ -428,20 +435,43 @@ COL_WIDTHS = {
     'R': 6.664, 'S': 7.332,
 }
 
-# Russian words in "places:" text → English
-RU_WORDS = [
-    ('обрешеток', 'crates'), ('обрешетки', 'crates'), ('обрешетка', 'crates'),
-    ('паллет',    'pallets'), ('паллеты',   'pallets'), ('паллета',   'pallet'),
-    ('коробок',   'cartons'), ('коробки',   'cartons'), ('коробка',   'carton'),
-    ('коробов',   'transport boxes'), ('короба', 'transport boxes'),
-    ('коробу',    'transport boxes'), ('короб',  'transport box'),
-    ('часть',     'part of'),
+# Russian packaging words → English, with (stem, singular, plural).
+# Ordered so carton forms are consumed before the shorter "transport box" stem.
+_PLACE_WORDS = [
+    (r'обрешет\w*',  'crate',         'crates'),
+    (r'паллет\w*',   'pallet',        'pallets'),
+    (r'палл\w*',     'pallet',        'pallets'),
+    (r'поддон\w*',   'pallet',        'pallets'),
+    (r'коробк\w*',   'carton',        'cartons'),
+    (r'коробок',     'carton',        'cartons'),
+    (r'кор\.',       'carton',        'cartons'),
+    (r'короб\w*',    'transport box', 'transport boxes'),
+    (r'мест\w*',     'unit',          'units'),
 ]
 
+# Cyrillic letters that are visual twins of Latin ones (data-entry artefacts in
+# product names / dimensions, e.g. "НТMM" → "HTMM", "58х250" → "58x250").
+_HOMOGLYPHS = str.maketrans({
+    'А':'A','В':'B','Е':'E','К':'K','М':'M','Н':'H','О':'O','Р':'P',
+    'С':'C','Т':'T','Х':'X','а':'a','е':'e','к':'k','м':'m','о':'o',
+    'р':'p','с':'c','х':'x','у':'y',
+})
+
+def _delatinize(text):
+    """Convert stray Cyrillic homoglyphs to their Latin twins."""
+    return text.translate(_HOMOGLYPHS)
+
 def _translate_places(text):
-    """Replace Russian packaging words with English in free-form text."""
-    for ru, en in RU_WORDS:
-        text = re.sub(ru, en, text, flags=re.IGNORECASE)
+    """Replace Russian packaging words with English, matching singular/plural to
+    the number that precedes the word ("1 поддон" → "1 pallet",
+    "4 поддона" → "4 pallets"). Unnumbered occurrences default to plural."""
+    for stem, sing, plur in _PLACE_WORDS:
+        def _num(m, s=sing, p=plur):
+            n = int(m.group(1))
+            return f'{m.group(1)}{m.group(2)}{s if n == 1 else p}'
+        text = re.sub(r'(\d+)(\s*)' + stem, _num, text, flags=re.IGNORECASE)
+        text = re.sub(stem, plur, text, flags=re.IGNORECASE)
+    text = re.sub(r'\bчаст\w*', 'part of', text, flags=re.IGNORECASE)
     return text
 
 # ─── XLSX MAIN ────────────────────────────────────────────────────────────────
@@ -458,7 +488,28 @@ def process_xlsx(src, dst, params, log):
     wb = openpyxl.load_workbook(src, data_only=False)
     ws = wb.active
 
-    DEL_COL = 3; DEL_FROM = 2; DEL_CNT = 2
+    # ── Detect header row & "Наименование" column dynamically ────────────────
+    hdr_row = None
+    name_col = 3
+    for r in range(2, 13):
+        joined = ' '.join(str(ws.cell(r, c).value) for c in range(1, 20)
+                          if ws.cell(r, c).value not in (None, ''))
+        if (('Артикул' in joined or 'Artikel' in joined or 'Item' in joined)
+                and 'Наименование' in joined):
+            hdr_row = r
+            for c in range(1, 20):
+                v = ws.cell(r, c).value
+                if isinstance(v, str) and v.strip() == 'Наименование':
+                    name_col = c
+                    break
+            break
+    if hdr_row is None:
+        hdr_row = 5
+
+    # Target layout: row1 title, row2 blank, row3 header, row4+ data.
+    DEL_COL = name_col
+    DEL_FROM = 2
+    DEL_CNT = max(0, hdr_row - 3)
 
     def new_row(r):
         if r < DEL_FROM: return r
@@ -479,7 +530,7 @@ def process_xlsx(src, dst, params, log):
             if nc is None: continue
             v = ws.cell(r, c).value
             if isinstance(v, str) and v.startswith('='):
-                formula_fixes[(nr, nc)] = '=' + _upd_formula(v[1:])
+                formula_fixes[(nr, nc)] = '=' + _upd_formula(v[1:], DEL_COL, DEL_FROM, DEL_CNT)
 
     # Structural deletions
     ws.delete_rows(DEL_FROM, DEL_CNT)
@@ -521,11 +572,11 @@ def process_xlsx(src, dst, params, log):
 
     # ── Update footer Russian labels + translate Russian packaging words ───────
     for r in range(1, ws.max_row+1):
-        for c in range(1, 5):
+        for c in range(1, 16):
             v = ws.cell(r, c).value
             if not isinstance(v, str): continue
 
-            # Delivery / payment terms (col B)
+            # Delivery / payment / shipment terms (col B)
             if 'Условия поставки' in v:
                 ws.cell(r, c).value = 'Delivery terms - FCA Warszawa '
                 if r > 1 and ws.cell(r-1, c).value in (None, ''):
@@ -533,15 +584,28 @@ def process_xlsx(src, dst, params, log):
                     log(f'  ✓ Дата отгрузки: {date_str}')
             elif 'Условия платежа' in v:
                 ws.cell(r, c).value = 'Payment terms: 100% prepayment'
+            elif 'Дата отгрузки' in v:
+                nv = v.replace('Дата отгрузки', 'Shipment date')
+                if date_str:
+                    nv = re.sub(r'\d{2}\.\d{2}\.\d{4}', date_str, nv)
+                ws.cell(r, c).value = nv
             elif v.strip() in ('Итого:', 'ИТОГО'):
                 ws.cell(r, c).value = None
 
             # Translate Russian packaging words in any cell text
-            translated = _translate_places(v)
+            translated = _translate_places(ws.cell(r, c).value or v)
             if translated != v:
                 ws.cell(r, c).value = translated
 
-    log('  ✓ Футер переведён (кг→kg, шт→pcs, паллет/коробов/обрешеток→EN)')
+    # ── Normalize stray Cyrillic homoglyphs in the Description column (col 3) ──
+    for r in range(4, ws.max_row+1):
+        lp = ws.cell(r, 1).value
+        if lp is not None and str(lp).replace('.', '').isdigit():
+            d = ws.cell(r, 3).value
+            if isinstance(d, str):
+                ws.cell(r, 3).value = _delatinize(d)
+
+    log('  ✓ Футер переведён (kg/pcs, паллет/поддон/короб/обрешет/места→EN)')
 
     # ── Add Seller block at bottom ─────────────────────────────────────────────
     last = ws.max_row
