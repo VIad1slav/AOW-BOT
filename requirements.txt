@@ -1,3 +1,5 @@
 python-telegram-bot==21.0.1
 python-docx>=0.8.11
 openpyxl>=3.1.0
+pypdf>=3.17.0
+rapidocr-onnxruntime>=1.4.0

@@ -12,6 +12,7 @@ from collections import Counter, defaultdict
 
 # Pre-compiled regex patterns (faster than re.compile on each call)
 _RE_DATE      = re.compile(r'\d{4}-\d{2}-\d{2}')
+_RE_CYR       = re.compile('[а-яА-ЯёЁ]')
 _RE_CELL_REF  = re.compile(r'(\$?)([A-Z]+)(\$?)(\d+)')
 _RE_EUR_AMT   = re.compile(r'[\d\u00a0 ]+,\d{2}')
 _RE_FOOTER    = re.compile(r'\b109\d{4}')
@@ -53,55 +54,77 @@ def _set(para, text):
     else:
         para.add_run(text)
 
-def get_articles_from_xlsx(xlsx_path, log):
-    """Return set of article strings from XLSX spec."""
-    import openpyxl
-    wb = openpyxl.load_workbook(xlsx_path, data_only=True)
-    ws = wb.active
-    art_col, hdr_row = None, None
+_ART_KEYWORDS = ('Artikel', 'Article', 'Артикул', 'SKU')
+
+# Rows whose article cell carries one of these words are table furniture —
+# subtotals, delivery terms — rather than goods. The two lists differ by
+# 'Date of': only the article scan drops it, while item rows are additionally
+# required to carry a quantity. Kept apart so merging the two readers below
+# stayed a pure refactor.
+_ART_SKIP  = ('Итого', 'Total', 'ИТОГО', 'TOTAL', 'Условия',
+              'Delivery', 'Payment', 'Shipment', 'Date of', 'Дата отгрузки')
+_ITEM_SKIP = ('Итого', 'Total', 'ИТОГО', 'TOTAL', 'Условия',
+              'Delivery', 'Payment', 'Shipment', 'Дата отгрузки')
+
+def _find_article_col(ws):
+    """Locate the article column and the header row it sits on."""
     for r in range(1, 9):
         for c in range(1, 5):
             v = ws.cell(r, c).value
-            if v and any(k in str(v) for k in ('Artikel', 'Article', 'Артикул')):
-                art_col, hdr_row = c, r; break
-        if art_col: break
+            if v and any(k in str(v) for k in _ART_KEYWORDS):
+                return c, r
+    return None, None
+
+def _find_price_cols(ws, hdr_row, art_col):
+    """Columns holding E-Price and Total EUR.
+
+    Стандартный формат: E-Price на art_col+10, Total EUR на art_col+11.
+    Новый формат (с доп. колонкой "Country of origin" и PiecesPerPal перед
+    ценой): E-Price на art_col+12, Total EUR на art_col+13. Вместо жёстких
+    смещений сканируем строку заголовка по ключевым словам и падаем обратно
+    на смещения, только если заголовки не нашлись."""
+    price_col = total_col = None
+    for c in range(art_col, min(ws.max_column + 1, art_col + 20)):
+        hv = ws.cell(hdr_row, c).value
+        if not isinstance(hv, str):
+            continue
+        hvl = hv.lower()
+        if price_col is None and ('e-price' in hvl or 'цена за 1шт' in hvl):
+            price_col = c
+        elif price_col is not None and total_col is None and ('итого' in hvl or 'total eur' in hvl):
+            total_col = c
+        if price_col and total_col:
+            break
+    return price_col or art_col + 10, total_col or art_col + 11
+
+def read_xlsx_spec(xlsx_path, log):
+    """Read a supplier spec in one pass and return (articles, items).
+
+    These used to be two functions that opened the same workbook separately and
+    repeated the column-detection block word for word."""
+    import openpyxl
+    wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+    ws = wb.active
+
+    art_col, hdr_row = _find_article_col(ws)
     if art_col is None:
         log('  ⚠ Колонка Artikel не найдена в XLSX')
-        return set()
-    arts = set()
-    for r in range(hdr_row + 1, ws.max_row + 1):
-        v = ws.cell(r, art_col).value
-        if v:
-            s = str(v).strip()
-            if s and not any(w in s for w in ('Итого', 'Total', 'ИТОГО', 'TOTAL')):
-                arts.add(s)
-    log(f'  ✓ Найдено {len(arts)} артикулов в спецификации')
-    return arts
+        return set(), []
 
-def get_xlsx_items_data(xlsx_path, log):
-    """Return all item rows from XLSX as list of dicts."""
-    import openpyxl
-    wb = openpyxl.load_workbook(xlsx_path, data_only=True)
-    ws = wb.active
-    art_col, hdr_row = None, None
-    for r in range(1, 9):
-        for c in range(1, 5):
-            v = ws.cell(r, c).value
-            if v and any(k in str(v) for k in ('Artikel', 'Article', 'Артикул')):
-                art_col, hdr_row = c, r; break
-        if art_col: break
-    if art_col is None: return []
-    # Detect English description column (col after article)
     desc_col = art_col + 2   # col 4 = English description in original XLSX
-    qty_col  = art_col + 7   # col 9  = Quantity pcs
-    price_col= art_col + 10  # col 12 = E-Price
-    total_col= art_col + 11  # col 13 = Total EUR
-    items = []
-    for r in range(hdr_row+1, ws.max_row+1):
+    qty_col  = art_col + 7   # col 9 = Quantity pcs
+    price_col, total_col = _find_price_cols(ws, hdr_row, art_col)
+
+    arts, items = set(), []
+    for r in range(hdr_row + 1, ws.max_row + 1):
         art = str(ws.cell(r, art_col).value or '').strip()
+        if not art:
+            continue
+        if not any(w in art for w in _ART_SKIP):
+            arts.add(art)
         qty = ws.cell(r, qty_col).value
-        if not art or not qty: continue
-        if any(w in art for w in ('Итого','Total','ИТОГО','TOTAL','Условия','Delivery','Payment','Shipment')): continue
+        if not qty or any(w in art for w in _ITEM_SKIP):
+            continue
         items.append({
             'article': art,
             'desc':    str(ws.cell(r, desc_col).value or '').strip(),
@@ -109,8 +132,9 @@ def get_xlsx_items_data(xlsx_path, log):
             'price':   ws.cell(r, price_col).value,
             'total':   ws.cell(r, total_col).value,
         })
+    log(f'  ✓ Найдено {len(arts)} артикулов в спецификации')
     log(f'  ✓ XLSX: {len(items)} строк данных')
-    return items
+    return arts, items
 
 # ─── DOCX MAIN ────────────────────────────────────────────────────────────────
 
@@ -435,12 +459,271 @@ COL_WIDTHS = {
     'R': 6.664, 'S': 7.332,
 }
 
+ROW_HEIGHT = 19.2        # data rows
+HEADER_LINE_PT = 10.8    # one wrapped line of header text, incl. cell padding
+PT_PER_WIDTH = 5.5545    # Excel column-width unit → points, as LibreOffice maps it
+PRINT_LAST_COL = 15      # column O — everything past it is left out of the print area
+CELL_PADDING_PT = 3.0    # padding assumed when estimating how header text wraps
+GLYPH_EM = 0.52          # average glyph advance as a fraction of the font size
+
+# Measuring a number is a different job from guessing where a header wraps. The
+# header estimate is deliberately pessimistic — wrapping early only makes the
+# row taller — while a number must be measured accurately, because every point
+# of column width taken here is width the page may not have. Hence its own
+# padding, calibrated against real output: "8,982.110" at 8pt fitted a 38.25pt
+# column and did not fit a 36.40pt one.
+NUM_PADDING_PT = 2.0     # padding a number actually keeps inside its cell
+NUM_MARGIN_PT  = 1.0     # breathing room added when widening a column
+A4_LONG_PT     = 841.89  # width of an A4 page in landscape
+
+# Advance widths in Arial / Liberation Sans, as a fraction of the font size.
+_DIGIT_EM = 0.556
+_CHAR_EM  = {',': 0.278, '.': 0.278, ' ': 0.278, '-': 0.333,
+             '%': 0.889, '(': 0.333, ')': 0.333}
+
+def _text_pt(text, font_size, padding=NUM_PADDING_PT):
+    """Width the text needs inside a cell, padding included."""
+    em = sum(_CHAR_EM.get(ch, _DIGIT_EM) for ch in str(text))
+    return em * font_size + padding
+
+def _format_number(value, fmt):
+    """Render a number the way the spreadsheet will show it.
+
+    Accurate enough to measure: thousands separators and the number of decimals
+    are what move the width, and those are what this reproduces."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    fmt = (fmt or 'General').split(';')[0]
+    if fmt in ('', '@', 'General'):
+        # General shows a whole number in full: f'{v:g}' would render the HS
+        # code 39172290 as '3.91723e+07' and ask for a far wider column.
+        if float(value).is_integer() and abs(value) < 1e15:
+            return str(int(value))
+        return f'{value:.10g}'
+    pct = '%' in fmt
+    if pct:
+        value *= 100
+    body = fmt.replace('%', '').replace('"', '').strip()
+    whole, _, frac = body.partition('.')
+    decimals = len(re.match(r'[0#]*', frac).group(0)) if frac else 0
+    shown = f'{value:,.{decimals}f}' if ',' in whole else f'{value:.{decimals}f}'
+    return shown + ('%' if pct else '')
+
+_RE_CELL_REF = re.compile(r'\$?([A-Z]{1,3})\$?(\d+)')
+_RE_RANGE    = re.compile(r'\$?([A-Z]{1,3})\$?(\d+):\$?([A-Z]{1,3})\$?(\d+)')
+_RE_SUM_CALL = re.compile(r'SUM\(([^()]*)\)', re.IGNORECASE)
+_RE_ARITH    = re.compile(r'^[0-9eE.+\-*/() ]*$')
+
+def _formula_values(ws):
+    """Return a lookup giving what each cell will DISPLAY, formulas included.
+
+    openpyxl stores formulas, never their results, and a file it has just
+    written carries no cached values either — yet a column has to be wide enough
+    for the result, or the spreadsheet shows "###" where the number should be.
+    These specs only ever use plain arithmetic and SUM over a range, so a small
+    evaluator covers them; anything it cannot work out comes back as None and
+    takes no part in sizing."""
+    cache, busy = {}, set()
+
+    def _number(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    def value(r, c):
+        key = (r, c)
+        if key in cache:
+            return cache[key]
+        if key in busy:                      # circular reference — give up here
+            return None
+        raw = ws.cell(r, c).value
+        if isinstance(raw, str) and raw.startswith('='):
+            busy.add(key)
+            raw = _evaluate(raw[1:])
+            busy.discard(key)
+        elif isinstance(raw, str):
+            raw = None
+        cache[key] = raw
+        return raw
+
+    def _term(r, c, in_sum=False):
+        """One cell as arithmetic sees it.
+
+        An empty cell is zero, exactly as Excel reads it — "=I59+G59" with an
+        empty G59 is a real line in these specs. A formula we could not work out
+        stays unknown instead of quietly counting as zero: that would understate
+        a total and leave its column too narrow, which is the very fault this
+        code exists to prevent. SUM skips text, plain arithmetic does not."""
+        raw = ws.cell(r, c).value
+        if raw is None:
+            return 0.0
+        if isinstance(raw, str) and not raw.startswith('='):
+            return 0.0 if in_sum else None
+        v = value(r, c)
+        return v if _number(v) else None
+
+    def _sum(argument):
+        total = 0.0
+        for part in argument.split(','):
+            m = _RE_RANGE.fullmatch(part)
+            if m:
+                r1, r2 = sorted((int(m.group(2)), int(m.group(4))))
+                c1, c2 = sorted((_col_l2n(m.group(1)), _col_l2n(m.group(3))))
+                terms = [_term(r, c, True) for r in range(r1, r2 + 1)
+                         for c in range(c1, c2 + 1)]
+            else:
+                ref = _RE_CELL_REF.fullmatch(part)
+                terms = [_term(int(ref.group(2)), _col_l2n(ref.group(1)), True)] if ref else []
+            if any(t is None for t in terms):
+                return None          # an unknown term: the total is unknown too
+            total += sum(terms)
+        return total
+
+    def _evaluate(expr):
+        expr = expr.replace(' ', '')
+        while True:
+            m = _RE_SUM_CALL.search(expr)
+            if not m:
+                break
+            total = _sum(m.group(1))
+            if total is None:
+                return None
+            expr = expr[:m.start()] + repr(total) + expr[m.end():]
+
+        def _plug(m):
+            v = _term(int(m.group(2)), _col_l2n(m.group(1)))
+            return repr(float(v)) if _number(v) else 'None'
+
+        expr = _RE_CELL_REF.sub(_plug, expr)
+        if 'None' in expr or not _RE_ARITH.match(expr):
+            return None          # refers to something we could not resolve
+        try:                     # arithmetic only by now: no names, no builtins
+            return eval(expr, {'__builtins__': {}}, {})
+        except Exception:
+            return None
+
+    return value
+
+def _fit_number_columns(ws, log):
+    """Widen printed columns until no number renders as "###".
+
+    Excel and LibreOffice replace a number with hashes when its column is too
+    narrow. Nothing is lost from the file, but the document is unreadable, and a
+    single one is easy to miss in a hundred-line spec. Text columns are left
+    alone — they wrap instead of turning into hashes.
+
+    Columns only ever grow, never shrink, and never past the printable width of
+    the page: a table spilling onto an extra page would be worse than a hash."""
+    value_of = _formula_values(ws)
+    widest = {}
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, PRINT_LAST_COL + 1):
+            cell = ws.cell(r, c)
+            shown = _format_number(value_of(r, c), cell.number_format)
+            if shown is None:
+                continue
+            need = _text_pt(shown, cell.font.size or 10)
+            if need > widest.get(c, (0,))[0]:
+                widest[c] = (need, f'{_col_n2l(c)}{r}', shown)
+
+    margins = ws.page_margins
+    used = sum((ws.column_dimensions[_col_n2l(c)].width or 8.43) * PT_PER_WIDTH
+               for c in range(1, PRINT_LAST_COL + 1))
+    printable = A4_LONG_PT - (float(margins.left or 0.7) + float(margins.right or 0.7)) * 72
+    slack = printable - used
+
+    widened = set()
+    for c, (need, where, shown) in sorted(widest.items()):
+        letter = _col_n2l(c)
+        current = (ws.column_dimensions[letter].width or 8.43) * PT_PER_WIDTH
+        if need <= current:
+            continue
+        grow = need + NUM_MARGIN_PT - current
+        if grow > slack:
+            log(f'  ⚠ {where} = «{shown}» шире столбца {letter}, '
+                'а расширять некуда — останется ###')
+            continue
+        ws.column_dimensions[letter].width = round((current + grow) / PT_PER_WIDTH, 3)
+        slack -= grow
+        widened.add(letter)
+        log(f'  ✓ Столбец {letter} расширен под «{shown}» ({where})')
+    return widened
+
+def _split_overlapping_cols(ws, widths):
+    """Keep inherited <col> ranges from overlapping the columns we set ourselves.
+
+    openpyxl registers a source range such as <col min="12" max="14" width="7.71"/>
+    under the letter of its FIRST column only, keeping max=14 on that object.
+    Setting the width of M or N then adds a second entry, and the saved file ends
+    up with two <col> elements covering the same column. Excel honours the last
+    one — which is why the spreadsheet looks right — but LibreOffice honours the
+    first, so in the PDF the 0.441-wide spacer between "Total EUR" and
+    "Pieces per pal" was drawn at the full 7.71 and turned into a visible gap.
+    Re-create the inherited width for any column we don't set, then trim the
+    range so nothing overlaps."""
+    ours = {_col_l2n(letter) for letter in widths}
+    for dim in list(ws.column_dimensions.values()):
+        if not dim.min or not dim.max or dim.min >= dim.max:
+            continue
+        clash = sorted(i for i in ours if dim.min < i <= dim.max)
+        if not clash:
+            continue
+        for i in range(clash[0], dim.max + 1):
+            if i in ours:
+                continue
+            keep = copy.copy(dim)
+            keep.min = keep.max = i
+            ws.column_dimensions[_col_n2l(i)] = keep
+        dim.max = clash[0] - 1
+
+def _wrapped_line_count(text, chars_per_line):
+    """Greedy word wrap, so a header's real line count can be estimated."""
+    total = 0
+    for para in str(text).split('\n'):
+        used, count = 0, 1
+        for word in para.split():
+            if used and used + 1 + len(word) > chars_per_line:
+                count += 1
+                used = len(word)
+            else:
+                used += (1 if used else 0) + len(word)
+        total += count
+    return total
+
+def _header_row_height(ws, row):
+    """Height the header row needs for its wrapped labels to fit.
+
+    Excel auto-fits any row that carries no stored height, so wrapped headers
+    ("Quantity packs", "Net weight, kg") look right in the spreadsheet. On
+    conversion LibreOffice does no such thing — it falls back to the default
+    12.75pt and the lower lines spill outside the cell borders. Storing an
+    explicit height is what keeps the PDF matching the spreadsheet.
+
+    The two programs also disagree about where a line breaks: on "Net weight, kg"
+    Excel wraps to three lines where LibreOffice fits two. The estimate below is
+    therefore deliberately pessimistic — a row a couple of points taller than
+    needed is invisible, a row one line short clips the text in Excel."""
+    lines = 1
+    for c in range(1, PRINT_LAST_COL + 1):   # leftover columns past O aren't printed
+        cell = ws.cell(row, c)
+        text = str(cell.value or '').strip()
+        if not text:
+            continue
+        width = ws.column_dimensions[_col_n2l(c)].width or 8.43
+        size = cell.font.size or 10
+        usable = width * PT_PER_WIDTH - CELL_PADDING_PT
+        chars = max(1, int(usable / (GLYPH_EM * size)))
+        lines = max(lines, min(_wrapped_line_count(text, chars), 4))
+    return round(lines * HEADER_LINE_PT, 1)
+
 # Russian packaging words → English, with (stem, singular, plural).
-# Ordered so carton forms are consumed before the shorter "transport box" stem.
+# Ordered so carton forms are consumed before the shorter "transport box" stem,
+# and so the full pallet spellings are consumed before the "пал." abbreviation —
+# the lookahead keeps that short stem from biting into an unrelated word such as
+# "палка" or "Палермо".
 _PLACE_WORDS = [
     (r'обрешет\w*',  'crate',         'crates'),
     (r'паллет\w*',   'pallet',        'pallets'),
     (r'палл\w*',     'pallet',        'pallets'),
+    (r'пал\.?(?![а-яё])', 'pallet',   'pallets'),
     (r'поддон\w*',   'pallet',        'pallets'),
     (r'коробк\w*',   'carton',        'cartons'),
     (r'коробок',     'carton',        'cartons'),
@@ -488,23 +771,70 @@ def process_xlsx(src, dst, params, log):
     wb = openpyxl.load_workbook(src, data_only=False)
     ws = wb.active
 
-    # ── Detect header row & "Наименование" column dynamically ────────────────
+    # ── Detect header row & Russian-description column dynamically ──────────
+    # Templates differ a lot between suppliers:
+    #  • some label the article col "Артикул"/"Artikel", others "SKU"/"Item"
+    #  • some label the Russian name col "Наименование", others just repeat
+    #    "Description" for both the Russian and English columns
+    # Relying on a single fixed keyword ("Наименование") silently breaks on
+    # formats that don't use it — the header row then gets misdetected,
+    # rows shift by the wrong amount, and a data row ends up overwritten by
+    # the English headers. Detect both more defensively instead.
     hdr_row = None
-    name_col = 3
     for r in range(2, 13):
-        joined = ' '.join(str(ws.cell(r, c).value) for c in range(1, 20)
-                          if ws.cell(r, c).value not in (None, ''))
-        if (('Артикул' in joined or 'Artikel' in joined or 'Item' in joined)
-                and 'Наименование' in joined):
+        joined = ' '.join(str(v) for v in
+                          (ws.cell(r, c).value for c in range(1, 20))
+                          if v not in (None, ''))
+        has_id_kw  = any(k in joined for k in
+                          ('Артикул', 'Artikel', 'Item', 'SKU', 'Article'))
+        has_qty_kw = ('Quantity' in joined or 'Кол-во' in joined or 'Qty' in joined)
+        if has_id_kw and has_qty_kw:
             hdr_row = r
-            for c in range(1, 20):
-                v = ws.cell(r, c).value
-                if isinstance(v, str) and v.strip() == 'Наименование':
-                    name_col = c
-                    break
             break
     if hdr_row is None:
-        hdr_row = 5
+        hdr_row = 5   # fall back to the original assumption
+
+    # Some suppliers (e.g. bilingual RU/EN templates) send column headers
+    # that need translating to the company's standard English labels.
+    # Others already send clean English headers ("Item", "SKU", "E-Price"...)
+    # — for those, overwriting with the standard label set only replaces
+    # correct text with different-but-also-correct text, and the same goes
+    # for the stray-Cyrillic-homoglyph cleanup further down (some suppliers'
+    # own English text legitimately uses a Cyrillic-look-alike character,
+    # e.g. "х" in dimensions, and it should be left exactly as supplied).
+    # Whether the header row contains any Cyrillic is a reliable signal for
+    # which kind of template this is.
+    translate_headers = any(
+        isinstance(v, str) and _RE_CYR.search(v)
+        for v in (ws.cell(hdr_row, c).value for c in range(1, ws.max_column + 1))
+    )
+
+    # Find the Russian-language description column to delete.
+    name_col = None
+    for c in range(1, 8):
+        v = ws.cell(hdr_row, c).value
+        if isinstance(v, str) and 'Наименование' in v:
+            name_col = c
+            break
+    if name_col is None:
+        # No literal "Наименование" label — some formats instead repeat the
+        # same "Description" header for both the RU and EN columns. Find the
+        # duplicate and use the sample row below to tell which one is Russian.
+        desc_cols = []
+        for c in range(1, 8):
+            v = ws.cell(hdr_row, c).value
+            if isinstance(v, str) and 'description' in v.lower():
+                desc_cols.append(c)
+        if len(desc_cols) >= 2:
+            for c in desc_cols:
+                sv = ws.cell(hdr_row + 1, c).value
+                if isinstance(sv, str) and _RE_CYR.search(sv):
+                    name_col = c
+                    break
+            if name_col is None:
+                name_col = desc_cols[0]   # leftmost of the duplicates
+    if name_col is None:
+        name_col = 3   # fall back to the original assumption
 
     # Target layout: row1 title, row2 blank, row3 header, row4+ data.
     DEL_COL = name_col
@@ -547,9 +877,12 @@ def process_xlsx(src, dst, params, log):
     log(f'  ✓ Заголовок: Spec No {spec_num}, {date_str}')
 
     # ── Update headers (row 3 = was row 5) ────────────────────────────────────
-    for c, h in NEW_HEADERS.items():
-        ws.cell(3, c).value = h
-    log('  ✓ Заголовки переведены на английский')
+    if translate_headers:
+        for c, h in NEW_HEADERS.items():
+            ws.cell(3, c).value = h
+        log('  ✓ Заголовки переведены на английский')
+    else:
+        log('  ✓ Заголовки уже на английском — оставлены как есть')
 
     # ── Replace «Германия» → «DE» in country column (col 5 after del) ─────────
     cnt = 0
@@ -570,22 +903,35 @@ def process_xlsx(src, dst, params, log):
         elif v == 'шт':
             ws.cell(r, 5).value = 'pcs'
 
-    # ── Update footer Russian labels + translate Russian packaging words ───────
+    # ── Update footer labels (RU or EN) + translate Russian packaging words ────
+    # Suppliers phrase these footer lines differently: some in Russian
+    # ("Условия поставки", "Дата отгрузки"...), others already in English
+    # ("Delivery terms:", "Date of shipment:"...) but with a placeholder or
+    # supplier-side value instead of the company's standard terms. Match
+    # either phrasing so the fixed company text always gets applied.
     for r in range(1, ws.max_row+1):
         for c in range(1, 16):
             v = ws.cell(r, c).value
             if not isinstance(v, str): continue
+            vl = v.lower()
 
             # Delivery / payment / shipment terms (col B)
-            if 'Условия поставки' in v:
+            if 'Условия поставки' in v or vl.startswith('delivery terms'):
                 ws.cell(r, c).value = 'Delivery terms - FCA Warszawa '
-                if r > 1 and ws.cell(r-1, c).value in (None, ''):
-                    ws.cell(r-1, c).value = f'Shipment date: {date_str}'
-                    log(f'  ✓ Дата отгрузки: {date_str}')
-            elif 'Условия платежа' in v:
+                if r > 1:
+                    above = ws.cell(r-1, c).value
+                    above_l = above.lower() if isinstance(above, str) else ''
+                    if (above in (None, '') or 'дата отгрузки' in above_l
+                            or 'date of shipment' in above_l
+                            or above_l.startswith('shipment date')):
+                        ws.cell(r-1, c).value = f'Shipment date: {date_str}'
+                        log(f'  ✓ Дата отгрузки: {date_str}')
+            elif 'Условия платежа' in v or vl.startswith('payment terms'):
                 ws.cell(r, c).value = 'Payment terms: 100% prepayment'
-            elif 'Дата отгрузки' in v:
-                nv = v.replace('Дата отгрузки', 'Shipment date')
+            elif ('Дата отгрузки' in v or 'date of shipment' in vl
+                    or vl.startswith('shipment date')):
+                nv = re.sub(r'(?i)(Дата отгрузки|Date of shipment|Shipment date)',
+                             'Shipment date', v, count=1)
                 if date_str:
                     nv = re.sub(r'\d{2}\.\d{2}\.\d{4}', date_str, nv)
                 ws.cell(r, c).value = nv
@@ -598,20 +944,32 @@ def process_xlsx(src, dst, params, log):
                 ws.cell(r, c).value = translated
 
     # ── Normalize stray Cyrillic homoglyphs in the Description column (col 3) ──
-    for r in range(4, ws.max_row+1):
-        lp = ws.cell(r, 1).value
-        if lp is not None and str(lp).replace('.', '').isdigit():
-            d = ws.cell(r, 3).value
-            if isinstance(d, str):
-                ws.cell(r, 3).value = _delatinize(d)
+    # Only for suppliers whose template needed full RU→EN cleanup; suppliers
+    # who already send clean English text (e.g. "58х1000" with a Cyrillic х
+    # by their own convention) should have that text preserved as supplied.
+    if translate_headers:
+        for r in range(4, ws.max_row+1):
+            lp = ws.cell(r, 1).value
+            if lp is not None and str(lp).replace('.', '').isdigit():
+                d = ws.cell(r, 3).value
+                if isinstance(d, str):
+                    ws.cell(r, 3).value = _delatinize(d)
 
     log('  ✓ Футер переведён (kg/pcs, паллет/поддон/короб/обрешет/места→EN)')
 
     # ── Add Seller block at bottom ─────────────────────────────────────────────
+    # Position differs slightly between templates: the bilingual (translated)
+    # layout leaves one blank row before it and sits at cols J/L, while the
+    # already-English (Golfstream-style) layout follows immediately with no
+    # blank row and sits one column to the left, at cols I/K.
     last = ws.max_row
-    ws.cell(last + 2, 10).value = 'Seller'
-    ws.cell(last + 2, 12).value = 'AOW GROUP SP. z o.o.'
-    ws.cell(last + 3, 12).value = 'NIP/TIN  PL5272934015'
+    if translate_headers:
+        seller_row, label_col, value_col = last + 2, 10, 12
+    else:
+        seller_row, label_col, value_col = last + 1, 9, 11
+    ws.cell(seller_row, label_col).value = 'Seller'
+    ws.cell(seller_row, value_col).value = 'AOW GROUP SP. z o.o.'
+    ws.cell(seller_row + 1, value_col).value = 'NIP/TIN  PL5272934015'
     log('  ✓ Добавлен блок Seller')
 
     # ── Page setup: landscape A4 ───────────────────────────────────────────────
@@ -627,25 +985,43 @@ def process_xlsx(src, dst, params, log):
     ws.col_breaks.brk.append(Break(id=15))
     log('  ✓ Разрыв страницы после столбца O (Quantity pl)')
 
+    # ── Item rows: the ones numbered in column A ─────────────────────────────
+    item_rows = [r for r in range(4, ws.max_row + 1)
+                 if str(ws.cell(r, 1).value or '').replace('.', '').isdigit()]
+
     # ── Column widths ─────────────────────────────────────────────────────────
     for col_letter, width in COL_WIDTHS.items():
         ws.column_dimensions[col_letter].width = width
-    log('  ✓ Ширины столбцов установлены')
 
     # ── Fix number format: 2 decimal places for E-Price and Total EUR ──────────
-    for r in range(4, ws.max_row + 1):
-        lp = ws.cell(r, 1).value
-        if lp and str(lp).replace('.','').isdigit():
-            ws.cell(r, 11).number_format = '0.00'   # E-Price
-            ws.cell(r, 12).number_format = '0.00'   # Total EUR
+    # Runs before the columns are measured: the format decides what is shown,
+    # and what is shown decides how wide the column has to be.
+    for r in item_rows:
+        ws.cell(r, 11).number_format = '0.00'   # E-Price
+        ws.cell(r, 12).number_format = '0.00'   # Total EUR
     log('  ✓ Формат чисел: 2 знака после запятой')
 
-    # ── Uniform row heights for item data rows only (not footer) ─────────────
-    for r in range(4, ws.max_row + 1):
-        lp = ws.cell(r, 1).value
-        if lp and str(lp).replace('.','').isdigit():
-            ws.row_dimensions[r].height = 19.2
+    widened = _fit_number_columns(ws, log)
+    _split_overlapping_cols(ws, set(COL_WIDTHS) | widened)
+    log('  ✓ Ширины столбцов установлены')
+
+    # ── Uniform row heights across the table body (not the footer) ───────────
+    # Item rows are the ones numbered in column A. The subtotal ("Total") rows
+    # sitting between them are not, and suppliers sometimes ship those with a
+    # stray height — one spec carried 54pt, nearly three times the rest — so the
+    # row towered over the table in both the XLSX and the PDF. Level everything
+    # from the first item row to the last; the footer keeps the template's own
+    # heights.
+    if item_rows:
+        for r in range(item_rows[0], item_rows[-1] + 1):
+            ws.row_dimensions[r].height = ROW_HEIGHT
     log('  ✓ Высота строк данных выровнена')
+
+    # ── Header row needs a stored height, see _header_row_height ─────────────
+    hdr_h = _header_row_height(ws, 3)
+    if (ws.row_dimensions[3].height or 0) < hdr_h:
+        ws.row_dimensions[3].height = hdr_h
+        log(f'  ✓ Высота строки заголовка задана явно ({hdr_h})')
 
     wb.save(dst)
     log(f'  💾 XLSX сохранён: {os.path.basename(dst)}')

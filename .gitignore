@@ -1,3 +1,11 @@
-.env
-*.docx
-*.xlsx
+__pycache__/
+*.pyc
+work/
+*.bak-*
+
+# Состояние во время работы. Здесь же персональные данные покупателей —
+# в репозиторий им не место.
+buyers.json
+bot_state.json
+proforma_refs.json
+github_seen.json
