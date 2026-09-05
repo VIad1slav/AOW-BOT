@@ -40,17 +40,17 @@ def check(name, got, want):
 
 def test_places_wording():
     print('\nЗапись мест: из спецификации в накладную')
-    check('точка с запятой становится плюсом',
+    check('запись переносится дословно',
           cmr._fmt_places('27 crates; 8 cartons (1 pallet)', ''),
-          '27 crates + 8 cartons (= 1 pallet)')
+          '27 crates; 8 cartons (1 pallet)')
     check('название груза дописывается в конец',
           cmr._fmt_places('9 cartons (1 pallet)', 'Sealtape'),
-          '9 cartons (= 1 pallet) Sealtape')
+          '9 cartons (1 pallet) Sealtape')
     check('скобка без числа остаётся как есть',
           cmr._fmt_places('4 cartons (part of pallets)', 'Blade'),
           '4 cartons (part of pallets) Blade')
     check('двойные пробелы схлопываются',
-          cmr._fmt_places('1 crate;  2 cartons', ''), '1 crate + 2 cartons')
+          cmr._fmt_places('1 crate;  2 cartons', ''), '1 crate; 2 cartons')
     check('пустая строка не ломает', cmr._fmt_places('', ''), '')
 
 
@@ -82,7 +82,7 @@ def test_goods_names():
 def test_from_specification():
     print('\nГрузовой блок берётся из готовой спецификации')
     if not os.path.exists(SPEC):
-        print('  ⏭  пропущено: нет образца спецификации в samples/')
+        check('образец спецификации на месте', False, True)
         return
     groups, total, (packs, colli, note) = cmr.groups_from_specs([SPEC])
     check('групп груза', len(groups), 2)
@@ -102,7 +102,7 @@ def test_from_specification():
 def test_filled_form():
     print('\nЗаполненный бланк')
     if not os.path.exists(SPEC):
-        print('  ⏭  пропущено: нет образца спецификации в samples/')
+        check('образец спецификации на месте', False, True)
         return
     from docx import Document
     params = {'invoice_num': 'FV26-111', 'date': '29.08.2026'}
@@ -116,7 +116,7 @@ def test_filled_form():
         check('ссылка на инвойс', t.rows[21].cells[0].text.strip(),
               'Invoice № FV26-111 dtd 29.08.2026')
         check('первая строка груза', t.rows[24].cells[0].text.strip(),
-              '27 crates + 8 cartons (= 1 pallet) + 1 transport box (= 1 pallet) PP')
+              '27 crates; 8 cartons (1 pallet); 1 transport box (1 pallet) PP')
         check('её код ТН ВЭД', t.rows[24].cells[24].text.strip(), '39172290')
         check('её вес', t.rows[24].cells[29].text.strip(), '6 547,29')
         check('вторая строка названа Fittings',
@@ -142,7 +142,7 @@ def test_dogruzy():
     """Одна машина — одна накладная, даже если счетов было несколько."""
     print('\nДогрузы: несколько спецификаций на одну машину')
     if not all(os.path.exists(p) for p in DOGRUZ):
-        print('  ⏭  пропущено: нет образцов догрузов в samples/')
+        check('образцы догрузов на месте', False, True)
         return
     groups, total, (packs, colli, note) = cmr.groups_from_specs(DOGRUZ)
 
@@ -166,8 +166,177 @@ def test_dogruzy():
           all(isinstance(g['gross'], float) for g in groups), True)
 
 
+COLLI_SPEC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          'samples', 'spec_colli.xlsx')
+
+
+def test_packaging_words():
+    """Упаковку поставщик пишет по-русски, в документы она идёт по-английски."""
+    print('\nПеревод упаковочных слов')
+    from processing import _translate_places as tr
+    check('одна труба', tr('1 труба'), '1 pipe')
+    check('несколько труб', tr('8 труб'), '8 pipes')
+    check('трубы среди прочего',
+          tr('50 обрешеток; 8 труб (1 паллета)'), '50 crates; 8 pipes (1 pallet)')
+    check('поддон', tr('4 поддона'), '4 pallets')
+    check('короб не спутан с коробкой', tr('31 короб'), '31 transport boxes')
+    check('коробка осталась коробкой', tr('8 коробок'), '8 cartons')
+
+
+def test_footer_labels():
+    """Строку мест подписывают то «places:», то «Colli:» — обе должны читаться."""
+    print('\nРазные подписи в футере')
+    if not os.path.exists(COLLI_SPEC):
+        print('  ⏭  пропущено: нет образца с подписью Colli в samples/')
+        return
+    groups, total, _ = cmr.groups_from_specs([COLLI_SPEC])
+    check('групп найдено', len(groups), 2)
+    check('описание мест не пустое', bool(groups[0]['places']), True)
+    check('это именно строка Colli',
+          groups[0]['places'].startswith('50 crates'), True)
+    # «TOTAL GROSS WEIGHT,KG:» без пробела перед KG тоже должно читаться
+    check('вес несмотря на «,KG» без пробела',
+          all(isinstance(g['gross'], float) for g in groups), True)
+    check('общий вес', round(total, 2), 17780.89)
+
+
+TOTAL_LINE_SPEC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'samples', 'spec_total_line.xlsx')
+
+
+def test_total_line_footer():
+    """Итог мест бывает написан одной фразой прямо в ячейке подписи.
+
+    В таких спецификациях нет отдельной ячейки с числом мест, и накладная
+    выходила с пустой строкой «Total colli:». Ожидаемые числа взяты не из
+    вывода кода, а из самой фразы спецификации и из суммы весов её групп.
+    """
+    print()
+    print('Футер, написанный одной строкой')
+    if not os.path.exists(TOTAL_LINE_SPEC):
+        print('  ⏭  пропущено: нет образца с однострочным итогом в samples/')
+        return
+    groups, total, (packs, colli, note) = cmr.groups_from_specs([TOTAL_LINE_SPEC])
+    check('упаковки взяты из фразы', packs, 754)
+    check('места взяты из фразы', colli, 107)
+    check('хвост фразы сохранён дословно', note, '106 pallets&crates + 1 carton')
+    check('групп груза', len(groups), 3)
+    check('общий вес — сумма групп', round(total, 2), 10546.50)
+
+    from docx import Document
+    params = {'invoice_num': 'FV26-69', 'date': '04.09.2026'}
+    with tempfile.TemporaryDirectory() as tmp:
+        dst = os.path.join(tmp, 'CMR SK 69.docx')
+        cmr.build_cmr([TOTAL_LINE_SPEC], params, dst)
+        t = Document(dst).tables[0]
+        check('итог совпал со спецификацией слово в слово',
+              t.rows[30].cells[0].text.strip(),
+              'Total colli: 754 packages/107 places = 106 pallets&crates + 1 carton')
+        check('итоговый вес', t.rows[30].cells[29].text.strip(), '10 546,50')
+
+
+def test_total_line_parsing():
+    """Разбор самой фразы — отдельно от файлов."""
+    print()
+    print('Разбор фразы итога')
+
+    def parse(s):
+        m = cmr._TOTAL_LINE.match(s)
+        return m.groups() if m else None
+
+    check('упаковки, места и хвост',
+          parse('Total colli: 754 packages/107 places = 106 pallets&crates + 1 carton'),
+          ('754', '107', '106 pallets&crates + 1 carton'))
+    check('без хвоста', parse('Total colli: 1050 packages/101 places'),
+          ('1050', '101', None))
+    check('только места', parse('TOTAL COLLI: 81 places'), (None, '81', None))
+    check('вторая «i» в подписи',
+          parse('Total collii: 12 packages/3 places')[:2], ('12', '3'))
+    # Голая подпись — это второй вид футера: число лежит в соседней ячейке,
+    # и разбирать здесь нечего.
+    check('голая подпись не разбирается', parse('Total colli'), None)
+
+
+def test_template_fonts():
+    """В бланке не должно остаться несуществующих имён шрифтов.
+
+    «Times New Roman Bold» — не семейство, а начертание. Word это прощает,
+    LibreOffice на сервере — нет: имя не находится, прогон уезжает в
+    подстановку, и в одной строке накладной оказывались разные шрифты.
+    """
+    print()
+    print('Шрифты бланка')
+    import re as _re
+    import zipfile
+    if not os.path.exists(cmr.TEMPLATE):
+        check('бланк на месте', False, True)
+        return
+    with zipfile.ZipFile(cmr.TEMPLATE) as z:
+        xml = z.read('word/document.xml').decode('utf-8')
+    names = set(_re.findall(r'w:(?:ascii|hAnsi|cs)="([^"]*)"', xml))
+    fake = sorted(n for n in names if _re.search(r'(Bold|Italic|CYR)$', n))
+    check('псевдо-имён шрифтов нет', fake, [])
+
+    from docx import Document
+    t = Document(cmr.TEMPLATE).tables[0]
+    weights = [t.rows[r].cells[cmr.COL_WEIGHT].paragraphs[0].runs[0]
+               for r in cmr.GOODS_ROWS]
+    # Часть прогонов шрифт не называет вовсе — они берут умолчание документа.
+    # Это нормально ровно до тех пор, пока умолчание тоже Times New Roman:
+    # ломалось раньше не отсутствие имени, а имя несуществующего семейства.
+    with zipfile.ZipFile(cmr.TEMPLATE) as z:
+        styles = z.read('word/styles.xml').decode('utf-8')
+    default = _re.search(r'<w:rPrDefault>.*?w:ascii="([^"]*)"', styles, _re.S)
+    check('умолчание документа', default and default.group(1), 'Times New Roman')
+    check('колонка веса — один шрифт на все строки',
+          {r.font.name for r in weights} - {None}, {'Times New Roman'})
+    check('и один размер', {r.font.size.pt for r in weights}, {9.0})
+    check('жирность не потерялась', {r.font.bold for r in weights}, {True})
+
+
+def test_template_logo():
+    """Надпись «CMR» должна стоять по центру овала, а не на пустых местах.
+
+    В образце она держалась на четырёх пробелах в левой части широкой рамки —
+    при другом шрифте ширина пробела уезжает и буквы вылезают за овал. Проверка
+    сторожит настоящее выравнивание: рамка совпадает с овалом, абзац центрован.
+    """
+    print()
+    print('Надпись CMR в овале')
+    import re as _re
+    import zipfile
+    if not os.path.exists(cmr.TEMPLATE):
+        check('бланк на месте', False, True)
+        return
+    with zipfile.ZipFile(cmr.TEMPLATE) as z:
+        xml = z.read('word/document.xml').decode('utf-8')
+
+    def geometry(shape_id):
+        m = _re.search(r'<v:\w+ id="%s"[^>]*style="([^"]*)"' % shape_id, xml)
+        if not m:
+            return None
+        st = dict(p.split(':', 1) for p in m.group(1).split(';') if ':' in p)
+        return tuple(st.get(k) for k in ('left', 'top', 'width', 'height'))
+
+    oval, rect = geometry('Oval 4'), geometry('Rectangles 3')
+    check('рамка надписи совпала с овалом', rect, oval)
+
+    start = xml.index('<v:rect id="Rectangles 3"')
+    box = xml[start:xml.index('</v:rect>', start)]
+    check('по вертикали — по середине', 'v-text-anchor:middle' in box, True)
+    check('по горизонтали — по центру', '<w:jc w:val="center"/>' in box, True)
+    check('ведущих пробелов не осталось',
+          _re.search(r'<w:t xml:space="preserve">\s+</w:t>', box), None)
+
+
 def main():
     print('Проверка накладной CMR')
+    test_packaging_words()
+    test_footer_labels()
+    test_total_line_footer()
+    test_total_line_parsing()
+    test_template_fonts()
+    test_template_logo()
     test_dogruzy()
     test_places_wording()
     test_weight_format()

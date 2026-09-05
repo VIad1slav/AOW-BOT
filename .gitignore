@@ -9,3 +9,8 @@ buyers.json
 bot_state.json
 proforma_refs.json
 github_seen.json
+
+# Образцы для проверок — настоящие счета и спецификации покупателей.
+# В открытом репозитории лежит только их описание.
+samples/*
+!samples/README.md

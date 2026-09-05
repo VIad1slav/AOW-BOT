@@ -44,18 +44,27 @@ def _fmt_weight(value):
 
 
 def _fmt_places(text, goods_name):
-    """Specification wording → CMR wording.
+    """Packing description for the CMR, plus the goods name.
 
-    "27 crates; 8 cartons (1 pallet); 1 transport box (1 pallet)"
-    becomes
-    "27 crates + 8 cartons (= 1 pallet) + 1 transport box (= 1 pallet) PP".
-    A parenthesis that isn't a count, such as "(part of pallets)", is left alone.
+    The wording is carried over from the specification exactly as written —
+    "50 crates; 8 pipes (1 pallet); 11 cartons (2 pallets)". Customs checks the
+    waybill against the specification, so rewriting the separators there only
+    creates differences between two documents that are supposed to agree.
     """
-    parts = [p.strip() for p in str(text or '').split(';') if p.strip()]
-    joined = ' + '.join(parts)
-    joined = re.sub(r'\((\d)', r'(= \1', joined)
-    joined = re.sub(r'\s{2,}', ' ', joined).strip()
+    joined = re.sub(r'\s{2,}', ' ', str(text or '')).strip().rstrip(';').strip()
     return f'{joined} {goods_name}'.strip() if goods_name else joined
+
+
+# Итог мест поставщик подписывает двумя разными способами. Либо это подпись
+# «TOTAL COLLI:» с числом в соседней ячейке, либо целая фраза в одной ячейке —
+# «Total colli: 754 packages/107 places = 106 pallets&crates + 1 carton», то
+# есть уже готовая строка накладной. Второй вид разбирается этим выражением:
+# отдельной ячейки с числом там нет, и без разбора итог выходил пустым.
+_TOTAL_LINE = re.compile(
+    r'total\s+colli+\s*:\s*'
+    r'(?:(\d+)\s*packages?\s*/\s*)?'
+    r'(\d+)\s*places?'
+    r'(?:\s*=\s*(.+?))?\s*$', re.IGNORECASE)
 
 
 def _label(ws, row):
@@ -106,7 +115,10 @@ def groups_from_specs(spec_paths, log=lambda m: None):
                 # last group's range also reaches the sheet's grand total, and
                 # taking that one silently reported the whole truck's weight as
                 # if it belonged to one HS code.
-                if lab == 'places' and not places:
+                # Одни спецификации подписывают эту строку «places:»,
+                # другие «Colli:». Грандиозный итог ниже называется
+                # «TOTAL COLLI» и сюда не попадает — он длиннее.
+                if lab in ('places', 'colli') and not places:
                     places = text(r, 4)
                 elif lab.startswith('total gross weight') and gross is None:
                     gross = value_of(r, 4)
@@ -131,11 +143,23 @@ def groups_from_specs(spec_paths, log=lambda m: None):
                 v = value_of(r, 4)
                 if isinstance(v, (int, float)):
                     spec_colli = v
-                spec_note = text(r, 5).strip('() ')
+                # Расшифровка по видам тары из соседней ячейки в накладную не
+                # идёт — решено по образцу CMR SK 114.
             elif lab == 'total packs':
                 v = value_of(r, 4)
                 if isinstance(v, (int, float)):
                     spec_packs = v
+            elif lab.startswith('total colli'):
+                m = _TOTAL_LINE.match(text(r, 3))
+                if m:
+                    if m.group(1):
+                        spec_packs = int(m.group(1))
+                    spec_colli = int(m.group(2))
+                    # Хвост здесь — часть фразы, которую написал поставщик, а
+                    # не наша расшифровка, поэтому он переносится дословно.
+                    spec_note = (m.group(3) or '').strip()
+                else:
+                    log('  ⚠ CMR: не разобрана строка итога — ' + text(r, 3))
         colli += spec_colli or 0
         packs += spec_packs or 0
         if spec_note:
@@ -217,6 +241,9 @@ def build_cmr(spec_paths, params, dst, log=lambda m: None):
     if isinstance(colli, (int, float)):
         bits.append(f'{colli:g} places')
     line = 'Total colli: ' + '/'.join(bits) if bits else 'Total colli:'
+    # Хвост дописывается, только когда спецификация сама написала итог фразой:
+    # накладная обязана совпадать со спецификацией слово в слово. Собственную
+    # расшифровку по видам тары бот не сочиняет — решено по образцу CMR SK 114.
     if note:
         line += f' = {note}'
     _set_cell(tbl.rows[TOTAL_ROW].cells[COL_DESC], line)

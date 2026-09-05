@@ -729,6 +729,7 @@ _PLACE_WORDS = [
     (r'коробок',     'carton',        'cartons'),
     (r'кор\.',       'carton',        'cartons'),
     (r'короб\w*',    'transport box', 'transport boxes'),
+    (r'труб\w*',     'pipe',          'pipes'),
     (r'мест\w*',     'unit',          'units'),
 ]
 

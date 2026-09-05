@@ -12,3 +12,5 @@ Pro Forma и готовые спецификации для накладной C
 - `openlane_sample.pdf`, `openlane_ru.pdf` — счета OPENLANE
 - `spec_golfstream.xlsx` — готовая спецификация
 - `spec_dogruz_1.xlsx`, `spec_dogruz_2.xlsx` — две спецификации одной машины
+- `spec_colli.xlsx` — футер с подписью «Colli:» вместо «places:»
+- `spec_total_line.xlsx` — футер, где весь итог написан одной фразой
