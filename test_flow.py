@@ -133,6 +133,8 @@ NAMES = {b.COLLECT: 'COLLECT', b.ASK_INV: 'ASK_INV', b.ASK_DATE: 'ASK_DATE',
          b.PF_COLLECT: 'PF_COLLECT', b.PF_PRICE: 'PF_PRICE', b.PF_NUM: 'PF_NUM',
          b.PF_DATE: 'PF_DATE', b.PF_BUYER: 'PF_BUYER', b.PF_REFS: 'PF_REFS',
          b.PF_CONFIRM: 'PF_CONFIRM', b.PF_BUYER_ADDR: 'PF_BUYER_ADDR',
+         b.PP_COLLECT: 'PP_COLLECT', b.PP_NUM: 'PP_NUM', b.PP_DATE: 'PP_DATE',
+         b.PP_REF: 'PP_REF', b.PP_CONFIRM: 'PP_CONFIRM',
          None: 'нет диалога'}
 
 
@@ -436,6 +438,99 @@ async def main():
         check('.txt отклоняется, шаг тот же',
               await feed(make_doc_update(junk, 'note.txt')), 'PF_COLLECT')
         junk.unlink(missing_ok=True)
+        await feed(make_cmd_update('cancel'))
+
+    print('— Pro Forma по спецификации (GOLFSTREAM) —')
+    await feed(make_cmd_update('cancel'))
+    SPEC_XLSX = Path(b.BASE_DIR) / 'samples' / 'pipes_spec_126.xlsx'
+    SPEC_NAME = 'Proforma AOW - Golfstream - Specification 126 (AB01139034).xlsx'
+    if not SPEC_XLSX.exists():
+        print('  ПРОПУЩЕНО: нет образца', SPEC_XLSX)
+    else:
+        check('/proformapipes → PP_COLLECT',
+              await feed(make_cmd_update('proformapipes')), 'PP_COLLECT')
+        check('лишний текст не ломает PP_COLLECT',
+              await feed(make_text_update('привет')), 'PP_COLLECT')
+        check('XLSX принят',
+              await feed(make_doc_update(SPEC_XLSX, SPEC_NAME)), 'PP_COLLECT')
+        ud = app.user_data[UID]
+        check('  позиций разобрано', len(ud['pipes']['items']), 38)
+        check('  сумма', ud['pipes']['total'], 27827.49)
+        check('  номер спецификации из имени', ud.get('pp_spec'), '126')
+        check('  код без букв и нуля', ud.get('pp_code'), '1139034')
+        check('  в поток фактуры файл не попал', ud.get('xlsx'), None)
+
+        check('«Продолжить» → PP_DATE', await feed(make_cb_update('pp_go')), 'PP_DATE')
+        check('чушь вместо даты не двигает шаг',
+              await feed(make_text_update('позавчера')), 'PP_DATE')
+        check('кнопка даты → PP_NUM',
+              await feed(make_cb_update('ppdate|03.09.2026')), 'PP_NUM')
+        check('  дата в ISO', ud.get('pf_date'), '2026-09-03')
+        check('  срок оплаты +25 дней', ud.get('pf_termin'), '2026-09-28')
+
+        print('— номер: год и месяц из даты выставления —')
+        check('мусор вместо номера не двигает шаг',
+              await feed(make_text_update('')), 'PP_NUM')
+        check('один номер → PP_CONFIRM',
+              await feed(make_text_update('110')), 'PP_CONFIRM')
+        check('  «110» превратилось в PF26-9/110', ud.get('pf_num'), 'PF26-9/110')
+
+        await feed(make_cb_update('back|pp_num'))
+        await feed(make_text_update('26-8/109'))
+        check('полный номер остаётся как есть', ud.get('pf_num'), 'PF26-8/109')
+        await feed(make_cb_update('back|pp_num'))
+        await feed(make_text_update('PF2026-9/111'))
+        check('четырёхзначный год укорачивается', ud.get('pf_num'), 'PF26-9/111')
+        await feed(make_cb_update('back|pp_num'))
+        await feed(make_text_update('9/112'))
+        check('«9/112» → добавляется только год', ud.get('pf_num'), 'PF26-9/112')
+
+        # A document written in October but dated September must be numbered by
+        # the date on it, not by the day it was typed.
+        await feed(make_cb_update('back|pp_date'))
+        await feed(make_text_update('30.09.2026'))
+        await feed(make_text_update('113'))
+        check('номер идёт за датой документа, а не за сегодня',
+              ud.get('pf_num'), 'PF26-9/113')
+        await feed(make_cb_update('back|pp_date'))
+        await feed(make_cb_update('ppdate|03.09.2026'))
+        await feed(make_text_update('110'))
+
+        print('— правка нижней строки —')
+        check('кнопка → PP_REF', await feed(make_cb_update('pp_ref')), 'PP_REF')
+        check('одно число не проходит', await feed(make_text_update('126')), 'PP_REF')
+        check('два числа → PP_CONFIRM',
+              await feed(make_text_update('77 0000042')), 'PP_CONFIRM')
+        check('  номер спецификации', ud.get('pp_spec'), '77')
+        check('  ведущие нули срезаны', ud.get('pp_code'), '42')
+        await feed(make_cb_update('pp_ref'))
+        await feed(make_text_update('126 1139034'))
+
+        print('— «Назад» внутри Pro Forma по спецификации —')
+        check('назад к номеру', await feed(make_cb_update('back|pp_num')), 'PP_NUM')
+        check('назад к дате', await feed(make_cb_update('back|pp_date')), 'PP_DATE')
+        check('назад к файлу', await feed(make_cb_update('back|pipes')), 'PP_COLLECT')
+        check('файл на месте', bool(ud.get('pipes')), True)
+
+        print('— создание документа —')
+        await feed(make_cb_update('pp_go'))
+        await feed(make_cb_update('ppdate|03.09.2026'))
+        await feed(make_text_update('110'))
+        BOT.documents.clear()
+        check('«Создать» завершает диалог',
+              await feed(make_cb_update('pp_run')), 'нет диалога')
+        check('  документ отправлен', BOT.documents,
+              ['Faktura Pro Forma PF26-9-110.docx'])
+        check('  номер запомнен для подсказки',
+              b._load_state().get('last_pf'), '26-9/110')
+        b._save_state({})
+        await feed(make_cmd_update('cancel'))
+
+        print('— XLSX вне этого раздела по-прежнему идёт в фактуру —')
+        check('спецификация без команды → COLLECT',
+              await feed(make_doc_update(SPEC_XLSX, SPEC_NAME)), 'COLLECT')
+        check('  файл в списке спецификаций',
+              len(app.user_data[UID].get('xlsx', [])), 1)
         await feed(make_cmd_update('cancel'))
 
     print('— подсказка следующего номера —')

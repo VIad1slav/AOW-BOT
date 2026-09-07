@@ -17,6 +17,7 @@ SUITES = [
     ('translit — адрес в польскую латиницу', 'test_translit.py'),
     ('passport — чтение MRZ паспорта', 'test_passport.py'),
     ('proforma — разбор PDF и сборка DOCX', 'test_proforma.py'),
+    ('proforma_pipes — Pro Forma по спецификации', 'test_proforma_pipes.py'),
     ('cmr — накладная из спецификации', 'test_cmr.py'),
     ('bot — маршрутизация всего диалога', 'test_flow.py'),
 ]
@@ -57,49 +58,75 @@ try {
 '''
 
 
+def sample_documents(tmp):
+    """One document per template, so a broken template is caught by the office
+    check and not by the customer. Returns [(label, path), ...]."""
+    sys.path.insert(0, str(HERE))
+    import proforma as pf
+    import proforma_pipes as pp
+
+    car = Path(tmp) / pf.out_filename('PF26-9/2')
+    pf.build_proforma(car, {
+        'pf_num': 'PF26-9/2', 'date': '2026-09-02', 'termin': '2026-09-09',
+        'buyer_name': 'TEST BUYER', 'buyer_info': 'Belarus\npaszport: X1',
+        'vehicles': [{'model': 'PEUGEOT 308 VP', 'plate': 'FW-646-BP',
+                      'reg_date': '23/12/2020', 'vin': 'VF3LPHNSKLS232589',
+                      'cn': '87032290', 'clearance': '145', 'price': 5400}],
+    })
+
+    pipes = Path(tmp) / pp.out_filename('PF26-9/3')
+    pp.build_pipes_proforma(pipes, {
+        'pf_num': 'PF26-9/3', 'date': '2026-09-02', 'termin': '2026-09-27',
+        'spec': '126', 'code': '1139034',
+        'items': [
+            {'artikel': '116060', 'name': 'HTEM Pipe DN/OD 125х2000 mm ',
+             'qty': 54, 'price': 6.05, 'amount': 326.70},
+            {'artikel': '335040', 'name': 'Skolan Safe-EM Pipe DN/OD 110х1000 mm ',
+             'qty': 640, 'price': 5.64, 'amount': 3609.60},
+            {'artikel': '220630-03', 'name': 'KGK Cap DN/OD 110 ',
+             'qty': 800, 'price': 0.79, 'amount': 632.00},
+        ],
+    })
+    return [('Pro Forma (машины)', car), ('Pro Forma (спецификация)', pipes)]
+
+
 def word_check():
-    """Windows only: open the Pro Forma in the real Word and export a PDF.
+    """Windows only: open every Pro Forma in the real Word and export a PDF.
 
     This is the check that actually matters — Word is what opens these
     documents in the end, and it is stricter about malformed OOXML than
     python-docx is.
     """
     import tempfile
-    sys.path.insert(0, str(HERE))
-    import proforma as pf
     with tempfile.TemporaryDirectory() as tmp:
-        src = Path(tmp) / pf.out_filename('PF26-9/2')
-        pf.build_proforma(src, {
-            'pf_num': 'PF26-9/2', 'date': '2026-09-02', 'termin': '2026-09-09',
-            'buyer_name': 'TEST BUYER', 'buyer_info': 'Belarus\npaszport: X1',
-            'vehicles': [{'model': 'PEUGEOT 308 VP', 'plate': 'FW-646-BP',
-                          'reg_date': '23/12/2020', 'vin': 'VF3LPHNSKLS232589',
-                          'cn': '87032290', 'clearance': '145', 'price': 5400}],
-        })
+        docs = sample_documents(tmp)
         script = Path(tmp) / 'open.ps1'
         script.write_text(WORD_PS, encoding='utf-8')
-        try:
-            proc = subprocess.run(
-                ['powershell', '-NoProfile', '-NonInteractive',
-                 '-ExecutionPolicy', 'Bypass', '-File', str(script), str(src)],
-                capture_output=True, text=True, encoding='utf-8',
-                errors='replace', timeout=180)
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            print('  ⏭  ПРОПУЩЕНО — Word недоступен')
-            return True
+        good = True
+        for label, src in docs:
+            try:
+                proc = subprocess.run(
+                    ['powershell', '-NoProfile', '-NonInteractive',
+                     '-ExecutionPolicy', 'Bypass', '-File', str(script), str(src)],
+                    capture_output=True, text=True, encoding='utf-8',
+                    errors='replace', timeout=180)
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                print('  ⏭  ПРОПУЩЕНО — Word недоступен')
+                return True
 
-        out = (proc.stdout or '').strip()
-        if out.startswith('OK'):
-            _, pages, size = out.split()
-            print('  ✅ Word открыл документ и выгнал PDF '
-                  '(страниц: %s, %d КБ)' % (pages, int(size) // 1024))
-            return True
-        if 'Word.Application' in out or not out:
-            print('  ⏭  ПРОПУЩЕНО — Word не установлен')
-            return True
-        print('  ❌ Word не смог открыть документ')
-        print('     ' + out[:300])
-        return False
+            out = (proc.stdout or '').strip()
+            if out.startswith('OK'):
+                _, pages, size = out.split()
+                print('  ✅ Word открыл «%s» и выгнал PDF '
+                      '(страниц: %s, %d КБ)' % (label, pages, int(size) // 1024))
+                continue
+            if 'Word.Application' in out or not out:
+                print('  ⏭  ПРОПУЩЕНО — Word не установлен')
+                return True
+            print('  ❌ Word не смог открыть «%s»' % label)
+            print('     ' + out[:300])
+            good = False
+        return good
 
 
 def office_check():
@@ -122,8 +149,6 @@ def office_check():
         print('  ⏭  ПРОПУЩЕНО — LibreOffice не найден')
         return True
 
-    sys.path.insert(0, str(HERE))
-    import proforma as pf
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         control = tmp / 'control.docx'
@@ -131,17 +156,10 @@ def office_check():
         doc.add_paragraph('контрольный документ')
         doc.save(str(control))
 
-        src = tmp / pf.out_filename('PF26-9/2')
-        pf.build_proforma(src, {
-            'pf_num': 'PF26-9/2', 'date': '2026-09-02', 'termin': '2026-09-09',
-            'buyer_name': 'TEST BUYER', 'buyer_info': 'Belarus\npaszport: X1',
-            'vehicles': [{'model': 'PEUGEOT 308 VP', 'plate': 'FW-646-BP',
-                          'reg_date': '23/12/2020', 'vin': 'VF3LPHNSKLS232589',
-                          'cn': '87032290', 'clearance': '145', 'price': 5400}],
-        })
+        docs = sample_documents(tmp)
         proc = subprocess.run(
             [soffice, '--headless', '--convert-to', 'pdf', '--outdir', str(tmp),
-             str(control), str(src)],
+             str(control)] + [str(p) for _, p in docs],
             capture_output=True, text=True, timeout=240)
 
         def made(path):
@@ -152,14 +170,18 @@ def office_check():
             print('  ⏭  ПРОПУЩЕНО — этот LibreOffice не открывает DOCX вообще '
                   '(нет libreoffice-writer); XLSX→PDF это не затрагивает')
             return True
-        if made(src):
-            size = src.with_suffix('.pdf').stat().st_size // 1024
-            print('  ✅ LibreOffice открыл и сконвертировал Pro Forma (%d КБ)' % size)
-            return True
-        print('  ❌ контрольный документ открылся, а Pro Forma — нет: '
-              'дело в самом файле')
-        print('     ' + (proc.stderr or proc.stdout or '').strip()[:300])
-        return False
+        good = True
+        for label, src in docs:
+            if made(src):
+                size = src.with_suffix('.pdf').stat().st_size // 1024
+                print('  ✅ LibreOffice открыл и сконвертировал «%s» (%d КБ)'
+                      % (label, size))
+                continue
+            print('  ❌ контрольный документ открылся, а «%s» — нет: '
+                  'дело в самом файле' % label)
+            print('     ' + (proc.stderr or proc.stdout or '').strip()[:300])
+            good = False
+        return good
 
 
 def main():

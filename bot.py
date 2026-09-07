@@ -29,6 +29,11 @@ from proforma import (
     parse_facture, build_proforma, missing_fields, out_filename,
     parse_money, fmt_money, remember_refs,
 )
+from proforma_pipes import (
+    read_spec, refs_from_name, build_pipes_proforma,
+    out_filename as pipes_filename, fmt_qty,
+    TERMIN_DAYS as PIPES_TERMIN_DAYS,
+)
 from passport import (
     read_passport_photo, buyer_draft, ocr_available, FIELD_NAMES,
 )
@@ -61,19 +66,23 @@ WORK_DIR   = BASE_DIR / 'work'          # uploaded sources, per user
 STATE_FILE = BASE_DIR / 'bot_state.json'  # last used invoice / PF, for suggestions
 
 # ── Conversation states ───────────────────────────────────────────────────────
-# Two flows share one ConversationHandler. Which one you are in is decided by
+# Three flows share one ConversationHandler. Two of them start on their own from
 # the file you send: a DOCX/XLSX starts the invoice flow, a PDF starts the Pro
-# Forma flow that produces the DOCX the invoice flow needs.
+# Forma flow that produces the DOCX the invoice flow needs. The third — the
+# GOLFSTREAM pipes Pro Forma — also runs on an XLSX, so it cannot be told apart
+# by file type and is entered by /proformapipes instead.
 COLLECT, ASK_INV, ASK_DATE, ASK_SPEC, ASK_PF, CONFIRM = range(6)
 PF_COLLECT, PF_PRICE, PF_NUM, PF_DATE, PF_BUYER, PF_REFS, PF_CONFIRM = range(6, 13)
 PF_BUYER_ADDR = 13          # address + date of issue, the two the MRZ lacks
+PP_COLLECT, PP_NUM, PP_DATE, PP_REF, PP_CONFIRM = range(14, 19)
 
 # ── Commands shown in the Telegram "/" menu ──────────────────────────────────
 COMMANDS = [
-    BotCommand('start',    'Начать / загрузить файлы'),
-    BotCommand('proforma', 'Pro Forma из платёжки (PDF)'),
-    BotCommand('help',     'Как пользоваться ботом'),
-    BotCommand('cancel',   'Отменить и сбросить всё'),
+    BotCommand('start',         'Начать / загрузить файлы'),
+    BotCommand('proforma',      'Pro Forma из платёжки (PDF)'),
+    BotCommand('proformapipes', 'Pro Forma по спецификации (XLSX)'),
+    BotCommand('help',          'Как пользоваться ботом'),
+    BotCommand('cancel',        'Отменить и сбросить всё'),
 ]
 
 # ── Auth check ────────────────────────────────────────────────────────────────
@@ -180,21 +189,45 @@ def _plus_days(iso, days):
     return (datetime.strptime(iso, '%Y-%m-%d') + timedelta(days=days)).strftime('%Y-%m-%d')
 
 
-def _suggest_pf():
+def _suggest_pf(when=None):
     """Next Pro Forma number to offer as a one-tap button.
 
     AOW numbers them 'YY-M/NNN' — year, month, and a sequence that runs on
-    across months (26-6/78 in June, 26-8/106 in August). So the month is taken
-    from today and only the sequence is incremented; a year change resets it."""
+    across months (26-6/78 in June, 26-8/106 in August). So only the sequence is
+    incremented; a year change resets it. The year and month come from `when` —
+    the date the invoice is being issued for, which is not always today (a
+    document written on 1 October can still be dated 30 September)."""
+    when = when or datetime.now()
     last = (_load_state().get('last_pf') or '').strip()
     m = re.fullmatch(r'(\d{2})-(\d{1,2})/(\d+)', _norm_ref(last, 'PF'))
     if not m:
         return None
     yy_last, _, seq = m.groups()
-    yy, mm = _year2(), str(datetime.now().month)
+    yy, mm = when.strftime('%y'), str(when.month)
     if yy_last != yy:
         return f'{yy}-{mm}/1'
     return f'{yy}-{mm}/{int(seq) + 1}'
+
+
+def _norm_pf_num(raw, when=None):
+    """Normalise a Pro Forma number to the 'YY-M/NNN' form.
+
+    The year and the month are in the date the document is issued on, so typing
+    them again is pure ceremony: '110' on a 2026-09-03 invoice is 26-9/110. A
+    number typed out in full is kept as it stands, and a four-digit year is
+    shortened ('2026-9/110' → '26-9/110')."""
+    when = when or datetime.now()
+    s = _norm_ref(raw, 'PF')
+    if not s:
+        return ''
+    m = re.fullmatch(r'(?:19|20)(\d{2})([-/].+)', s)
+    if m:
+        return m.group(1) + m.group(2)
+    if re.fullmatch(r'\d{1,4}', s):                     # 110
+        return '{}-{}/{}'.format(when.strftime('%y'), when.month, s)
+    if re.fullmatch(r'\d{1,2}/\d{1,4}', s):             # 9/110
+        return '{}-{}'.format(when.strftime('%y'), s)
+    return s
 
 
 def _spec_from_name(name: str) -> str:
@@ -483,7 +516,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.effective_message.reply_text(
         "<b>ℹ️ Как пользоваться</b>\n\n"
-        "Бот умеет две вещи. Что именно делать — он понимает по формату файла.\n\n"
+        "Бот умеет три вещи. Две из них он понимает по формату файла, "
+        "третья — по команде.\n\n"
         "<b>📕 PDF → Pro Forma</b>\n"
         "1. Пришлите платёжку <code>(PDF)</code> — <b>Ayvens</b> (Facture VO), "
         "<b>SAG</b> или <b>OPENLANE</b>. Площадку бот определит сам; можно "
@@ -498,9 +532,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "(номер инвойса, дата, номера спецификаций, ссылка на Pro Forma).\n"
         "3. Проверьте сводку и нажмите <b>Создать документы</b>.\n"
         "Бот вернёт: <b>Faktura (DOCX)</b>, <b>Spec (XLSX)</b> и <b>Spec (PDF)</b>.\n\n"
+        "<b>🚰 XLSX → Pro Forma (линия GOLFSTREAM)</b>\n"
+        "1. Команда /proformapipes, затем пришлите спецификацию <code>(XLSX)</code>.\n"
+        "2. Артикулы, названия, количество и цены бот возьмёт из файла сам "
+        "<i>(колонка Unit Price — продажная, не закупочная)</i>. "
+        "Спросит только <b>номер и дату</b>.\n"
+        "3. Покупатель, условия поставки и оплата на этой линии всегда одни и те же, "
+        f"срок оплаты — <b>+{PIPES_TERMIN_DAYS} дней</b>.\n"
+        "4. Вернёт <b>Faktura Pro Forma (DOCX)</b>. Фактура, спецификация и CMR — "
+        "потом, после оплаты, через /start.\n\n"
         "<b>Команды</b>\n"
         "/start — начать заново\n"
         "/proforma — Pro Forma из платёжки\n"
+        "/proformapipes — Pro Forma по спецификации\n"
         "/cancel — сбросить всё\n"
         "/help — эта справка\n\n"
         "<i>Подсказки: на каждом шаге есть кнопка «Назад». "
@@ -554,11 +598,19 @@ async def _store_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if lower.endswith('.docx'):
         old = context.user_data.get('docx')
-        if old:
+        # Same name → same path: the download has already overwritten the old
+        # file, and unlinking it here would throw away the new one.
+        if old and Path(old['path']) != Path(dest):
             Path(old['path']).unlink(missing_ok=True)
         context.user_data['docx'] = {'path': dest, 'name': name}
         context.user_data['pf_guess'] = await asyncio.to_thread(extract_pf_ref, dest)
         return 'docx'
+
+    # An XLSX means one of two different things, and the file itself cannot say
+    # which: a specification for the invoice flow, or the goods for a pipes Pro
+    # Forma. The flow we are standing in decides.
+    if context.user_data.get('step') == PP_COLLECT:
+        return await _store_pipes_spec(update, context, dest, name)
 
     xlsx_list = context.user_data.setdefault('xlsx', [])
     entry = {'path': dest, 'name': name, 'spec': _spec_from_name(name)}
@@ -588,7 +640,8 @@ async def _store_facture(update, context, dest: Path, name: str):
     pdfs = context.user_data.setdefault('pdf', [])
     for i, x in enumerate(pdfs):                 # re-sending a file replaces it
         if x['name'] == name:
-            Path(x['path']).unlink(missing_ok=True)
+            if Path(x['path']) != Path(dest):    # same name → same path
+                Path(x['path']).unlink(missing_ok=True)
             pdfs.pop(i)
             break
     pdfs.append({'path': dest, 'name': name, 'source': head.get('source', ''),
@@ -596,13 +649,51 @@ async def _store_facture(update, context, dest: Path, name: str):
     context.bot_data['last_log'] = logs
     return 'pdf'
 
+async def _store_pipes_spec(update, context, dest: Path, name: str):
+    """Read an incoming specification for the pipes Pro Forma.
+
+    Only one specification at a time here: one Pro Forma covers one
+    specification on this line, so a second file replaces the first."""
+    logs = []
+    try:
+        data = await asyncio.to_thread(read_spec, dest, logs.append)
+    except Exception as e:
+        Path(dest).unlink(missing_ok=True)
+        logging.exception('Не удалось разобрать спецификацию')
+        context.bot_data['last_log'] = logs
+        await update.message.reply_text(
+            f"❌ <code>{html.escape(name)}</code> — не удалось разобрать: "
+            f"{html.escape(str(e))}",
+            parse_mode=ParseMode.HTML)
+        return None
+
+    old = context.user_data.get('pipes')
+    # Re-sending a file with the same name lands on the same path, and deleting
+    # "the old one" would then delete what we have just downloaded.
+    if old and Path(old['path']) != Path(dest):
+        Path(old['path']).unlink(missing_ok=True)
+    spec, code = refs_from_name(name)
+    context.user_data['pipes'] = {
+        'path': dest, 'name': name,
+        'items': data['items'], 'qty': data['qty'], 'total': data['total'],
+    }
+    # Only fill in what the file name gave us — a number the user has already
+    # corrected by hand must not be overwritten by the next upload.
+    context.user_data.setdefault('pp_spec', spec)
+    context.user_data.setdefault('pp_code', code)
+    context.bot_data['last_log'] = logs
+    return 'pipes'
+
 async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """A document arrived while we're collecting files (or while idle).
-    Whichever kind just arrived decides which of the two flows we show."""
+    Whichever kind just arrived decides which of the flows we show."""
     if not allowed(update):
         return
     kind = await _store_document(update, context)
     chat_id = update.effective_chat.id
+    if kind == 'pipes' or (kind is None and context.user_data.get('step') == PP_COLLECT):
+        await _ask_pipes(chat_id, context)
+        return PP_COLLECT
     if kind == 'pdf' or (kind is None and context.user_data.get('step') == PF_COLLECT):
         await _ask_pdf(chat_id, context)
         return PF_COLLECT
@@ -628,6 +719,8 @@ async def _reshow(chat_id, context):
         PF_DATE: _ask_pf_date, PF_BUYER: _ask_pf_buyer,
         PF_BUYER_ADDR: _ask_buyer_addr, PF_REFS: _ask_pf_refs,
         PF_CONFIRM: _ask_pf_confirm,
+        PP_COLLECT: _ask_pipes, PP_NUM: _ask_pp_num, PP_DATE: _ask_pp_date,
+        PP_REF: _ask_pp_ref, PP_CONFIRM: _ask_pp_confirm,
     }.get(step, _ask_files)
     await ask(chat_id, context)
     return step
@@ -1444,6 +1537,343 @@ async def cb_pf_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
                    header='<b>📕 Новая Pro Forma</b>')
     return PF_COLLECT
 
+# ══ Pro Forma по спецификации — линия GOLFSTREAM ═════════════════════════════
+# The sanitary-ware line. The buyer, the delivery terms and the payment method
+# never change here, so they sit in the template and are never asked for; the
+# specification carries the goods, the quantities and the prices. That leaves
+# two questions — the number and the date.
+#
+# The chain stops at the Pro Forma on purpose: payment runs up to 25 days, and
+# the invoice, the specification and the CMR are only worth making once the
+# money has arrived. They are made later, from the /start flow.
+
+def _pipes_summary(ud) -> str:
+    sp = ud.get('pipes')
+    if not sp:
+        return "📊 Спецификация (XLSX): <i>не загружена</i>"
+    lines = [f"📊 <code>{html.escape(sp['name'])}</code>",
+             f"     позиций <b>{len(sp['items'])}</b>, штук <b>{fmt_qty(sp['qty'])}</b>,"
+             f" на <b>{fmt_money(sp['total'])} EUR</b>"]
+    return '\n'.join(lines)
+
+def _pp_refs_line(ud) -> str:
+    spec = ud.get('pp_spec') or '—'
+    code = ud.get('pp_code') or '—'
+    return f"№ спецификации <b>{html.escape(spec)}</b>, код <b>{html.escape(code)}</b>"
+
+# ── Step 0: the specification ────────────────────────────────────────────────
+async def _ask_pipes(chat_id, context, header='<b>🚰 Pro Forma по спецификации</b>'):
+    ud = context.user_data
+    ud['step'] = PP_COLLECT
+    rows = []
+    if ud.get('pipes'):
+        tail = (f"{_pp_refs_line(ud)}\n\n"
+                "Пришлите другую спецификацию или нажмите <b>Продолжить</b>.")
+        rows.append([InlineKeyboardButton('▶️  Продолжить', callback_data='pp_go')])
+        rows.append([InlineKeyboardButton('🗑  Убрать файл', callback_data='pp_clear')])
+    else:
+        tail = ("Пришлите спецификацию в формате <code>XLSX</code> — "
+                "бот возьмёт из неё артикулы, названия, количество и цены "
+                "<i>(колонка Unit Price, не закупочная)</i>.\n"
+                "Покупатель и условия поставки на этой линии всегда одни и те же.")
+    await _card(chat_id, context, f"{header}\n\n{_pipes_summary(ud)}\n\n{tail}", rows)
+
+# ── Step 1: date ─────────────────────────────────────────────────────────────
+# The date is asked before the number on purpose: the year and the month of the
+# number are the year and the month of the date, so once the date is known the
+# number is just a sequence to type.
+async def _ask_pp_date(chat_id, context):
+    context.user_data['step'] = PP_DATE
+    today = datetime.now().strftime('%d.%m.%Y')
+    rows = [
+        [InlineKeyboardButton(f'📅  Сегодня — {today}', callback_data=f'ppdate|{today}')],
+        [_btn_back('pipes')],
+    ]
+    await _card(
+        chat_id, context,
+        "<b>Шаг 1 из 2 — дата выставления</b>\n\n"
+        "Нажмите кнопку или введите дату: <code>03.09.2026</code>\n"
+        f"<i>Срок оплаты бот поставит на {PIPES_TERMIN_DAYS} дней позже.</i>",
+        rows
+    )
+
+async def _set_pp_date(chat_id, context, raw):
+    iso = _iso_date(raw)
+    if not iso:
+        return None
+    context.user_data['pf_date'] = iso
+    context.user_data['pf_termin'] = _plus_days(iso, PIPES_TERMIN_DAYS)
+    await _ask_pp_num(chat_id, context)
+    return PP_NUM
+
+async def got_pp_date_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    await update.callback_query.answer()
+    return await _set_pp_date(update.effective_chat.id, context,
+                              update.callback_query.data.split('|', 1)[1])
+
+async def got_pp_date_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    state = await _set_pp_date(update.effective_chat.id, context, update.message.text)
+    if state is None:
+        await update.message.reply_text(
+            '📅 Не понял дату. Например: <code>03.09.2026</code>, '
+            '<code>3-9-26</code> или <code>03092026</code>.',
+            parse_mode=ParseMode.HTML)
+        return PP_DATE
+    return state
+
+# ── Step 2: Pro Forma number ─────────────────────────────────────────────────
+def _pp_when(ud):
+    """The date the document is issued on, as a datetime — that is where the
+    year and the month of the number come from. Falls back to today, which only
+    matters if the date step was somehow skipped."""
+    try:
+        return datetime.strptime(ud['pf_date'], '%Y-%m-%d')
+    except (KeyError, TypeError, ValueError):
+        return datetime.now()
+
+async def _ask_pp_num(chat_id, context):
+    ud = context.user_data
+    ud['step'] = PP_NUM
+    when = _pp_when(ud)
+    prefix = '{}-{}/'.format(when.strftime('%y'), when.month)
+    rows = []
+    guess = _suggest_pf(when)
+    if guess and len(guess) <= 40:
+        rows.append([InlineKeyboardButton(f'➡️  PF{guess}  (следующий)',
+                                          callback_data=f'ppnum|{guess}')])
+    rows.append([_btn_back('pp_date')])
+    await _card(
+        chat_id, context,
+        "<b>Шаг 2 из 2 — номер Pro Forma</b>\n\n"
+        f"Введите только номер: <code>110</code>  →  <b>PF{prefix}110</b>\n"
+        f"<i>Год и месяц ({prefix.rstrip('/')}) бот берёт из даты выставления. "
+        "Нужен другой — введите полностью, например <code>26-8/109</code>. "
+        "Нумерация общая с автомобильной линией.</i>",
+        rows
+    )
+
+async def _set_pp_num(chat_id, context, raw):
+    value = _norm_pf_num(raw, _pp_when(context.user_data))
+    if not value:
+        return None
+    context.user_data['pf_num'] = f'PF{value}'
+    context.user_data['pf_num_bare'] = value
+    await _ask_pp_confirm(chat_id, context)
+    return PP_CONFIRM
+
+async def got_pp_num_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    await update.callback_query.answer()
+    return await _set_pp_num(update.effective_chat.id, context,
+                             update.callback_query.data.split('|', 1)[1])
+
+async def got_pp_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    state = await _set_pp_num(update.effective_chat.id, context, update.message.text)
+    if state is None:
+        await update.message.reply_text('✏️ Введите номер, например <code>110</code>.',
+                                        parse_mode=ParseMode.HTML)
+        return PP_NUM
+    return state
+
+# ── The line at the foot of the invoice ──────────────────────────────────────
+async def _ask_pp_ref(chat_id, context):
+    context.user_data['step'] = PP_REF
+    await _card(
+        chat_id, context,
+        "<b>🔧 Номер спецификации и код</b>\n\n"
+        f"Сейчас: {_pp_refs_line(context.user_data)}\n\n"
+        "Введите оба через пробел: <code>126 1139034</code>\n"
+        "<i>Буквы и ведущий ноль из кода (AB01139034) убираются сами.</i>",
+        [[_btn_back('pp_confirm')]]
+    )
+
+async def got_pp_ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    parts = re.findall(r'\d+', update.message.text or '')
+    if len(parts) != 2:
+        await update.message.reply_text(
+            '✏️ Нужны два числа через пробел, например <code>126 1139034</code>.',
+            parse_mode=ParseMode.HTML)
+        return PP_REF
+    spec, code = parts
+    context.user_data['pp_spec'] = spec.lstrip('0') or '0'
+    context.user_data['pp_code'] = code.lstrip('0') or '0'
+    await _ask_pp_confirm(update.effective_chat.id, context)
+    return PP_CONFIRM
+
+# ── Confirmation ─────────────────────────────────────────────────────────────
+PP_PREVIEW = 5             # how many positions fit on the card comfortably
+
+async def _ask_pp_confirm(chat_id, context):
+    ud = context.user_data
+    ud['step'] = PP_CONFIRM
+    sp = ud.get('pipes') or {'items': [], 'qty': 0, 'total': 0}
+    items = sp['items']
+    listing = '\n'.join(
+        "     {}. <code>{}</code> {} — {} × {} = <b>{}</b>".format(
+            i, it['artikel'], html.escape((it['name'] or '').strip()),
+            fmt_qty(it['qty']), fmt_money(it['price']), fmt_money(it['amount']))
+        for i, it in enumerate(items[:PP_PREVIEW], 1))
+    if len(items) > PP_PREVIEW:
+        listing += f"\n     … и ещё {len(items) - PP_PREVIEW}"
+    text = (
+        "<b>🧾 Проверьте Pro Forma</b>\n\n"
+        f"Номер:  <b>{html.escape(ud.get('pf_num', ''))}</b>\n"
+        f"Дата:  <b>{html.escape(ud.get('pf_date', ''))}</b>\n"
+        f"Срок оплаты:  <b>{html.escape(ud.get('pf_termin', ''))}</b>"
+        f"  <i>(+{PIPES_TERMIN_DAYS} дней)</i>\n"
+        f"Покупатель:  <b>GOLFSTREAM s.r.o.</b>\n"
+        f"Нижняя строка:  {_pp_refs_line(ud)}\n\n"
+        f"{listing}\n\n"
+        f"Позиций <b>{len(items)}</b>, штук <b>{fmt_qty(sp['qty'])}</b>, "
+        f"итого <b>{fmt_money(sp['total'])} EUR</b>"
+    )
+    rows = [
+        [InlineKeyboardButton('🚀  Создать Pro Forma', callback_data='pp_run')],
+        [InlineKeyboardButton('🔧  Изменить № и код', callback_data='pp_ref')],
+        [_btn_back('pp_num')],
+        [InlineKeyboardButton('❌  Отменить', callback_data='cancel')],
+    ]
+    await _card(chat_id, context, text, rows)
+
+# ── Buttons ──────────────────────────────────────────────────────────────────
+async def cb_pp_go(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    await update.callback_query.answer()
+    if not context.user_data.get('pipes'):
+        await _ask_pipes(update.effective_chat.id, context)
+        return PP_COLLECT
+    await _ask_pp_date(update.effective_chat.id, context)
+    return PP_DATE
+
+async def cb_pp_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    await update.callback_query.answer('Файл убран')
+    sp = context.user_data.pop('pipes', None)
+    if sp:
+        Path(sp['path']).unlink(missing_ok=True)
+    # The reference line came from that file name — it goes with it.
+    context.user_data.pop('pp_spec', None)
+    context.user_data.pop('pp_code', None)
+    await _ask_pipes(update.effective_chat.id, context)
+    return PP_COLLECT
+
+async def cb_pp_ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    await update.callback_query.answer()
+    await _ask_pp_ref(update.effective_chat.id, context)
+    return PP_REF
+
+async def cb_pp_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    await update.callback_query.answer()
+    _wipe_work(update.effective_user.id)
+    context.user_data.clear()
+    await _ask_pipes(update.effective_chat.id, context,
+                     header='<b>🚰 Новая Pro Forma по спецификации</b>')
+    return PP_COLLECT
+
+async def cmd_proformapipes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    await _drop_card(context)
+    await _ask_pipes(update.effective_chat.id, context)
+    return PP_COLLECT
+
+async def hint_pp_collect(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    await update.effective_message.reply_text(
+        "📎 Жду спецификацию в формате <b>XLSX</b>. "
+        "Когда загружена — нажмите <b>Продолжить</b>.",
+        parse_mode=ParseMode.HTML,
+    )
+    return PP_COLLECT
+
+# ── Run: write the Pro Forma and hand it back ────────────────────────────────
+async def cb_pp_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    await update.callback_query.answer()
+    if not context.user_data.get('pipes'):
+        await _ask_pipes(update.effective_chat.id, context)
+        return PP_COLLECT
+    await _drop_card(context)
+    await _make_pipes_proforma(update.effective_chat.id, update.effective_user.id,
+                               context)
+    return ConversationHandler.END
+
+async def _make_pipes_proforma(chat_id, uid, context):
+    ud = context.user_data
+    logs = []
+    prog = await context.bot.send_message(chat_id=chat_id, text='⏳ Формирую Pro Forma…')
+    try:
+        sp = ud['pipes']
+        dest = _work_dir(uid) / pipes_filename(ud['pf_num'])
+        result = await asyncio.to_thread(build_pipes_proforma, dest, {
+            'pf_num': ud['pf_num'],
+            'date': ud['pf_date'],
+            'termin': ud['pf_termin'],
+            'spec': ud.get('pp_spec', ''),
+            'code': ud.get('pp_code', ''),
+            'items': sp['items'],
+        }, None, logs.append)
+
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+        with open(result['path'], 'rb') as fh:
+            await context.bot.send_document(chat_id=chat_id, document=fh,
+                                            filename=result['path'].name)
+        try:
+            await prog.delete()
+        except Exception:
+            pass
+
+        st = _load_state()
+        st['last_pf'] = ud.get('pf_num_bare', '')
+        _save_state(st)
+        context.bot_data['last_log'] = logs
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(f"✅ <b>{html.escape(ud['pf_num'])}</b> готова — "
+                  f"позиций {result['count']}, штук {fmt_qty(result['qty'])}, "
+                  f"итого <b>{fmt_money(result['total'])} EUR</b>\n"
+                  f"<i>Фактуру, спецификацию и CMR делаем после оплаты — /start</i>"),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton('🔄  Новая Pro Forma', callback_data='pp_new')],
+                [InlineKeyboardButton('🧾  Показать лог обработки', callback_data='log')],
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logging.exception('Не удалось собрать Pro Forma по спецификации')
+        context.bot_data['last_log'] = logs
+        try:
+            await prog.delete()
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"❌ Ошибка: <code>{html.escape(str(e))}</code>",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton('🧾  Показать лог обработки', callback_data='log')],
+                [InlineKeyboardButton('🔄  Начать заново', callback_data='pp_new')],
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
+
 # ── Back navigation ──────────────────────────────────────────────────────────
 async def cb_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
@@ -1457,8 +1887,17 @@ async def cb_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'buyer': (_ask_pf_buyer, PF_BUYER), 'confirm': (_ask_pf_confirm, PF_CONFIRM),
         'buyer_addr': (_ask_buyer_addr, PF_BUYER_ADDR),
     }
+    pp_steps = {
+        'pipes': (_ask_pipes, PP_COLLECT), 'pp_num': (_ask_pp_num, PP_NUM),
+        'pp_date': (_ask_pp_date, PP_DATE), 'pp_ref': (_ask_pp_ref, PP_REF),
+        'pp_confirm': (_ask_pp_confirm, PP_CONFIRM),
+    }
     if target in pf_steps:
         ask, state = pf_steps[target]
+        await ask(chat_id, context)
+        return state
+    if target in pp_steps:
+        ask, state = pp_steps[target]
         await ask(chat_id, context)
         return state
     if target == 'files':
@@ -1739,10 +2178,13 @@ def build_app():
         entry_points=[
             CommandHandler('start', cmd_start),
             CommandHandler('proforma', cmd_proforma),
+            CommandHandler('proformapipes', cmd_proformapipes),
             CommandHandler('help', cmd_help),
             CommandHandler('cancel', cmd_cancel),
             # Dropping files into the chat starts the flow — no command needed.
             # A PDF routes to the Pro Forma flow, a DOCX/XLSX to the invoice one.
+            # The pipes flow also runs on an XLSX, so it has no file of its own
+            # to start from and is entered by /proformapipes.
             MessageHandler(filters.Document.ALL, receive_file),
             CallbackQueryHandler(cb_go, pattern='^go$'),
             CallbackQueryHandler(cb_clear, pattern='^clear$'),
@@ -1752,6 +2194,9 @@ def build_app():
             CallbackQueryHandler(cb_pf_clear, pattern='^pf_clear$'),
             CallbackQueryHandler(cb_pf_new, pattern='^pf_new$'),
             CallbackQueryHandler(cb_pf_invoice, pattern='^pf_invoice$'),
+            CallbackQueryHandler(cb_pp_go, pattern='^pp_go$'),
+            CallbackQueryHandler(cb_pp_clear, pattern='^pp_clear$'),
+            CallbackQueryHandler(cb_pp_new, pattern='^pp_new$'),
             # Anything else while idle → a nudge instead of silence. This must
             # stay last, and `allow_reentry` must stay off: with re-entry on,
             # PTB checks entry points BEFORE the state handlers, so this
@@ -1851,6 +2296,39 @@ def build_app():
                 midflow_file,
                 MessageHandler(filters.ALL & ~filters.COMMAND, hint_text_expected),
             ],
+
+            # ── Pro Forma по спецификации (GOLFSTREAM) ──
+            PP_COLLECT: [
+                MessageHandler(filters.Document.ALL, receive_file),
+                CallbackQueryHandler(cb_pp_go, pattern='^pp_go$'),
+                CallbackQueryHandler(cb_pp_clear, pattern='^pp_clear$'),
+                MessageHandler(filters.ALL & ~filters.COMMAND, hint_pp_collect),
+            ],
+            PP_NUM: [
+                CallbackQueryHandler(got_pp_num_cb, pattern=r'^ppnum\|'),
+                CallbackQueryHandler(cb_back, pattern=r'^back\|'),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, got_pp_num),
+                midflow_file, hint_nontext,
+            ],
+            PP_DATE: [
+                CallbackQueryHandler(got_pp_date_cb, pattern=r'^ppdate\|'),
+                CallbackQueryHandler(cb_back, pattern=r'^back\|'),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, got_pp_date_text),
+                midflow_file, hint_nontext,
+            ],
+            PP_REF: [
+                CallbackQueryHandler(cb_back, pattern=r'^back\|'),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, got_pp_ref),
+                midflow_file, hint_nontext,
+            ],
+            PP_CONFIRM: [
+                CallbackQueryHandler(cb_pp_run, pattern='^pp_run$'),
+                CallbackQueryHandler(cb_pp_ref, pattern='^pp_ref$'),
+                CallbackQueryHandler(cb_back, pattern=r'^back\|'),
+                CallbackQueryHandler(cb_cancel, pattern='^cancel$'),
+                midflow_file,
+                MessageHandler(filters.ALL & ~filters.COMMAND, hint_text_expected),
+            ],
         },
         # /start, /cancel and /help must be reachable from inside a running
         # conversation — that is what fallbacks are for. Re-entry stays off on
@@ -1859,6 +2337,7 @@ def build_app():
             CommandHandler('cancel', cmd_cancel),
             CommandHandler('start', cmd_start),
             CommandHandler('proforma', cmd_proforma),
+            CommandHandler('proformapipes', cmd_proformapipes),
             CommandHandler('help', cmd_help),
         ],
         allow_reentry=False,
