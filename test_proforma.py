@@ -43,6 +43,25 @@ BUYER_NAME = 'IVANOU SIARHEI'
 BUYER_INFO = ('Belarus, Mińsk, \nul. Szyszkina 12-7\n'
               'paszport: MP1234567 od 25.03.2022 г.')
 
+
+def buyer_from_sample(path):
+    """The buyer exactly as the sample Pro Forma spells it.
+
+    The round-trip check is about layout: rebuilding the sample must reproduce
+    it character for character. Who the buyer is, is an input to that — and it
+    has to be read out of the sample. The constants above are deliberately not
+    a real person (this file is public), so feeding them into a comparison
+    against a real document made the check fail on the one difference it was
+    never meant to be about.
+    """
+    for par in iter_paragraphs(Document(str(path))):
+        text = par.text
+        if text.startswith('Kupujący') and '\t' in text:
+            name, _, info = text.split('\t', 1)[1].partition('\n')
+            if name.strip():
+                return name, info
+    return BUYER_NAME, BUYER_INFO
+
 failures = []
 
 
@@ -114,11 +133,12 @@ def test_roundtrip(head):
         print('  ⏭  ПРОПУЩЕНО — нет образца %s' % SAMPLE_DOCX)
         return
     v = dict(head['vehicles'][0], price=5400)
+    buyer_name, buyer_info = buyer_from_sample(SAMPLE_DOCX)
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / 'rt.docx'
         res = pf.build_proforma(out, {
             'pf_num': 'PF26-8/106', 'date': '2026-08-14', 'termin': '2026-08-21',
-            'buyer_name': BUYER_NAME, 'buyer_info': BUYER_INFO, 'vehicles': [v],
+            'buyer_name': buyer_name, 'buyer_info': buyer_info, 'vehicles': [v],
         })
         check('итог посчитан', res['total'] == 5400.0, str(res['total']))
 
