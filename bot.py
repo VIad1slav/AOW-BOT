@@ -1490,7 +1490,8 @@ async def _make_proforma(chat_id, uid, context):
             chat_id=chat_id,
             text=(f"✅ <b>{html.escape(ud['pf_num'])}</b> готова — "
                   f"позиций {result['count']}, итого "
-                  f"<b>{fmt_money(result['total'])} EUR</b>"),
+                  f"<b>{fmt_money(result['total'])} EUR</b>"
+                  + _warnings_block(logs)),
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton('📄  Сделать из неё фактуру',
                                       callback_data='pf_invoice')],
@@ -1850,7 +1851,8 @@ async def _make_pipes_proforma(chat_id, uid, context):
             text=(f"✅ <b>{html.escape(ud['pf_num'])}</b> готова — "
                   f"позиций {result['count']}, штук {fmt_qty(result['qty'])}, "
                   f"итого <b>{fmt_money(result['total'])} EUR</b>\n"
-                  f"<i>Фактуру, спецификацию и CMR делаем после оплаты — /start</i>"),
+                  f"<i>Фактуру, спецификацию и CMR делаем после оплаты — /start</i>"
+                  + _warnings_block(logs)),
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton('🔄  Новая Pro Forma', callback_data='pp_new')],
                 [InlineKeyboardButton('🧾  Показать лог обработки', callback_data='log')],
@@ -1925,6 +1927,35 @@ async def cb_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ── Core processing ───────────────────────────────────────────────────────────
+WARN_MARK = '⚠'
+WARN_LIMIT = 6            # more than this and the log is the place to look
+
+def _warnings_block(logs):
+    """The warnings out of a processing log, ready to append to the chat message.
+
+    Everything the run has to say used to live behind the «Показать лог»
+    button, and nobody presses it when the documents look finished. That is how
+    a CMR went out with a goods line missing its name. Whatever the run is
+    unsure about now travels with the documents themselves.
+    """
+    seen, found = set(), []
+    for line in logs:
+        if WARN_MARK not in line:
+            continue
+        text = line.replace(WARN_MARK, '').strip(' -–—')
+        if text and text not in seen:
+            seen.add(text)
+            found.append(text)
+    if not found:
+        return ''
+    shown = found[:WARN_LIMIT]
+    block = '\n\n⚠️ <b>Проверьте перед отправкой:</b>\n' + '\n'.join(
+        '• ' + html.escape(t) for t in shown)
+    if len(found) > len(shown):
+        block += f'\n• …и ещё {len(found) - len(shown)} — в логе обработки'
+    return block
+
+
 async def _process(chat_id, uid, context):
     ud = context.user_data
     inv_num  = f"FV{ud['inv']}"
@@ -2051,10 +2082,12 @@ async def _process(chat_id, uid, context):
         _save_state(st)
 
         context.bot_data['last_log'] = logs
+        done = (f"✅ <b>Готово</b> — отправлено файлов: <b>{sent}</b>\n"
+                f"Инвойс <b>{html.escape(inv_num)}</b> от {html.escape(date_str)}")
+        done += _warnings_block(logs)
         await context.bot.send_message(
             chat_id=chat_id,
-            text=(f"✅ <b>Готово</b> — отправлено файлов: <b>{sent}</b>\n"
-                  f"Инвойс <b>{html.escape(inv_num)}</b> от {html.escape(date_str)}"),
+            text=done,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton('🔄  Новый комплект', callback_data='new')],
                 [InlineKeyboardButton('🧾  Показать лог обработки', callback_data='log')],

@@ -36,6 +36,24 @@ def load_goods_names():
         return {}
 
 
+def missing_goods_names(hs_codes, names=None):
+    """The codes the dictionary has never heard of, in the order they appear.
+
+    A name written as an empty string is an answer, not a gap — for some codes
+    the customer puts no name on the waybill at all. Treating "" as missing
+    would raise a warning on every ordinary shipment, and a warning that cries
+    wolf is worse than none: the one time it matters it gets waved through.
+    """
+    names = load_goods_names() if names is None else names
+    seen, missing = set(), []
+    for code in hs_codes:
+        code = str(code)
+        if code not in names and code not in seen:
+            seen.add(code)
+            missing.append(code)
+    return missing
+
+
 def _fmt_weight(value):
     """11225.9 → '11 225,90', the way the sample CMR writes it."""
     if not isinstance(value, (int, float)):
@@ -222,18 +240,21 @@ def build_cmr(spec_paths, params, dst, log=lambda m: None):
         log(f'  ⚠ CMR: строк груза {len(groups)}, а на бланке помещается '
             f'{len(GOODS_ROWS)} — лишние не поместились')
 
-    unknown = []
-    for row_idx, group in zip(GOODS_ROWS, groups):
+    shown = groups[:len(GOODS_ROWS)]
+    for row_idx, group in zip(GOODS_ROWS, shown):
         name = names.get(str(group['hs']), '')
-        if not name:
-            unknown.append(str(group['hs']))
         row = tbl.rows[row_idx]
         _set_cell(row.cells[COL_DESC], _fmt_places(group['places'], name))
         _set_cell(row.cells[COL_HS], group['hs'])
         _set_cell(row.cells[COL_WEIGHT], _fmt_weight(group['gross']))
+
+    # A code nobody has named yet leaves the goods line without its name, and
+    # the waybill still looks finished — this went out once (Spec 81, lubricant
+    # under 34039900). The warning has to reach the chat, not just the log.
+    unknown = missing_goods_names((g['hs'] for g in shown), names)
     if unknown:
         log('  ⚠ CMR: нет названия груза для кода ' + ', '.join(unknown) +
-            ' — допишите в cmr_goods.json')
+            ' — строка ушла без названия, допишите код в cmr_goods.json')
 
     bits = []
     if isinstance(packs, (int, float)):

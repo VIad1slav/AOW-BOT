@@ -17,6 +17,10 @@ import cmr
 
 SPEC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                     'samples', 'spec_golfstream.xlsx')
+# Spec 81 — груз из трёх кодов, среди них смазка 34039900. На ней накладная
+# ушла клиенту с безымянной строкой груза; образец держим как регрессию.
+SPEC_LUB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        'samples', 'spec_lubricant_81.xlsx')
 
 failures = []
 
@@ -76,7 +80,81 @@ def test_goods_names():
     names = cmr.load_goods_names()
     check('код труб', names.get('39172290'), 'PP')
     check('код фитингов', names.get('39174000'), 'Fittings')
+    # Spec 81 привезла смазку под кодом 34039900, которого в справочнике не
+    # было, и строка груза ушла к клиенту без названия.
+    check('код смазки', names.get('34039900'), 'Lubricant')
     check('незнакомый код — пусто', names.get('00000000', ''), '')
+
+
+def test_unknown_codes():
+    print('\nЧего справочник не знает — про то надо предупредить')
+    names = {'39172290': 'PP', '73209090': ''}
+    check('незнакомый код попадает в список',
+          cmr.missing_goods_names(['39172290', '34039900'], names), ['34039900'])
+    # Пустое название — это ответ, а не пробел: для таких кодов заказчик
+    # ничего не пишет. Предупреждать о них — значит приучить не читать
+    # предупреждения вовсе.
+    check('намеренно пустое название не считается пробелом',
+          cmr.missing_goods_names(['73209090'], names), [])
+    check('код может прийти числом',
+          cmr.missing_goods_names([34039900], names), ['34039900'])
+    check('повтор кода не удваивает предупреждение',
+          cmr.missing_goods_names(['34039900', '34039900'], names), ['34039900'])
+    check('всё знакомо — предупреждать не о чем',
+          cmr.missing_goods_names(['39172290'], names), [])
+
+
+def test_lubricant_waybill():
+    """CMR SK 117 целиком: три кода, три названия, ни одной пустой строки.
+
+    Ожидаемые строки взяты не из вывода бота, а из накладной, которую на эту
+    же спецификацию сделал человек, — иначе проверка закрепила бы ту самую
+    ошибку, ради которой написана.
+    """
+    print('\nНакладная со смазкой (Spec 81 → CMR SK 117)')
+    if not os.path.exists(SPEC_LUB):
+        print('  ⏭  пропущено: нет образца spec_lubricant_81.xlsx в samples/')
+        return
+    from docx import Document
+    logs = []
+    with tempfile.TemporaryDirectory() as tmp:
+        dst = os.path.join(tmp, 'CMR SK 117.docx')
+        cmr.build_cmr([SPEC_LUB], {'invoice_num': 'FV26-117',
+                                   'date': '12.09.2026'}, dst, logs.append)
+        t = Document(dst).tables[0]
+
+        check('труба', t.rows[24].cells[0].text.strip(),
+              '2 transport boxes (pallets) PP')
+        check('фитинги', t.rows[25].cells[0].text.strip(),
+              '1080 cartons (59 pallets) Fittings')
+        check('смазка — со своим названием', t.rows[26].cells[0].text.strip(),
+              '1182 cartons (33 pallets) Lubricant')
+        check('код смазки', t.rows[26].cells[24].text.strip(), '34039900')
+        check('вес смазки', t.rows[26].cells[29].text.strip(), '14 999,70')
+        check('итог мест', t.rows[30].cells[0].text.strip(),
+              'Total colli: 2264 packages/94 places')
+        check('итоговый вес', t.rows[30].cells[29].text.strip(), '18 545,84')
+        check('ни одного предупреждения',
+              [l for l in logs if '⚠' in l], [])
+
+    # А если код из справочника убрать — строка уходит без названия, и об этом
+    # обязаны предупредить. Ради этой половины всё и затевалось.
+    real = cmr.load_goods_names
+    cmr.load_goods_names = lambda: {k: v for k, v in real().items()
+                                    if k != '34039900'}
+    try:
+        logs = []
+        with tempfile.TemporaryDirectory() as tmp:
+            dst = os.path.join(tmp, 'x.docx')
+            cmr.build_cmr([SPEC_LUB], {'invoice_num': 'FV26-117',
+                                       'date': '12.09.2026'}, dst, logs.append)
+            check('без справочника строка безымянная',
+                  Document(dst).tables[0].rows[26].cells[0].text.strip(),
+                  '1182 cartons (33 pallets)')
+        check('и про это сказано вслух',
+              any('34039900' in l and '⚠' in l for l in logs), True)
+    finally:
+        cmr.load_goods_names = real
 
 
 def test_from_specification():
@@ -342,6 +420,8 @@ def main():
     test_weight_format()
     test_file_name()
     test_goods_names()
+    test_unknown_codes()
+    test_lubricant_waybill()
     test_from_specification()
     test_filled_form()
     print('\n' + ('✅ ВСЁ ПРОШЛО' if not failures
