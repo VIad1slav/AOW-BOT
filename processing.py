@@ -54,7 +54,10 @@ def _set(para, text):
     else:
         para.add_run(text)
 
-_ART_KEYWORDS = ('Artikel', 'Article', 'Артикул', 'SKU')
+# The supplier renames these headers without warning: specifications up to
+# Spec 81 said "Article", Spec 84 (18.09.2026) says "Item". Nothing else in the
+# sheet moved. Matching is case-insensitive for the same reason.
+_ART_KEYWORDS = ('artikel', 'article', 'артикул', 'sku', 'item')
 
 # Rows whose article cell carries one of these words are table furniture —
 # subtotals, delivery terms — rather than goods. The two lists differ by
@@ -66,14 +69,38 @@ _ART_SKIP  = ('Итого', 'Total', 'ИТОГО', 'TOTAL', 'Условия',
 _ITEM_SKIP = ('Итого', 'Total', 'ИТОГО', 'TOTAL', 'Условия',
               'Delivery', 'Payment', 'Shipment', 'Дата отгрузки')
 
+def _hdr(value) -> str:
+    """A header cell, normalised: 'Quantity\\npcs' → 'quantity pcs'."""
+    return ' '.join(str(value or '').split()).lower()
+
+
 def _find_article_col(ws):
-    """Locate the article column and the header row it sits on."""
-    for r in range(1, 9):
-        for c in range(1, 5):
-            v = ws.cell(r, c).value
-            if v and any(k in str(v) for k in _ART_KEYWORDS):
-                return c, r
+    """Locate the article column and the header row it sits on.
+
+    An exact header wins over a cell that merely contains the word: the title
+    above the table is free text, and a stray "item" in it would anchor the
+    whole reader to the wrong row."""
+    cells = [(r, c, _hdr(ws.cell(r, c).value))
+             for r in range(1, 9) for c in range(1, 5)]
+    for r, c, text in cells:
+        if text in _ART_KEYWORDS:
+            return c, r
+    for r, c, text in cells:
+        if text and any(k in text for k in _ART_KEYWORDS):
+            return c, r
     return None, None
+
+
+def _find_col(ws, hdr_row, art_col, names, reject=()):
+    """The column whose header is one of `names`, scanning right from the
+    article column. `reject` guards the near-misses that sit beside the column
+    we actually want — "Quantity packs" and "Quantity pl" both live next to
+    "Quantity", and picking one of those puts pallet counts into the invoice."""
+    for c in range(art_col, min(ws.max_column + 1, art_col + 20)):
+        text = _hdr(ws.cell(hdr_row, c).value)
+        if text and text not in reject and text in names:
+            return c
+    return None
 
 def _find_price_cols(ws, hdr_row, art_col):
     """Columns holding E-Price and Total EUR.
@@ -108,12 +135,30 @@ def read_xlsx_spec(xlsx_path, log):
 
     art_col, hdr_row = _find_article_col(ws)
     if art_col is None:
-        log('  ⚠ Колонка Artikel не найдена в XLSX')
-        return set(), []
+        # Returning an empty set here used to mean "no filtering": the invoice
+        # came out as a straight copy of the Pro Forma, unchecked against what
+        # actually ships. That is how FV26-121 went out 192 EUR over, carrying
+        # a position the shipment did not contain. An unreadable specification
+        # has to stop the run, not quietly disable the check.
+        seen = [_hdr(ws.cell(r, c).value) for r in range(1, 9)
+                for c in range(1, 6) if _hdr(ws.cell(r, c).value)]
+        raise ValueError(
+            'в спецификации {} не найдена колонка артикула (ожидались '
+            '{}). Найденные заголовки: {}'.format(
+                Path(xlsx_path).name, ', '.join(_ART_KEYWORDS),
+                ', '.join(seen[:12]) or 'ни одного'))
 
-    desc_col = art_col + 2   # col 4 = English description in original XLSX
-    qty_col  = art_col + 7   # col 9 = Quantity pcs
+    # Columns are located by their headers, not by a fixed offset from the
+    # article column: the two layouts in use differ by one column (the Russian
+    # description), and counting from the article silently read "Producer" as
+    # the description and net weight as the quantity.
+    desc_col = _find_col(ws, hdr_row, art_col, ('description',)) or art_col + 2
+    qty_col = _find_col(ws, hdr_row, art_col, ('quantity', 'quantity pcs', 'quantity шт'),
+                        reject=('quantity packs', 'quantity pl', 'quantity pallets')) \
+        or art_col + 7
     price_col, total_col = _find_price_cols(ws, hdr_row, art_col)
+    log('  ✓ Колонки: артикул {}, описание {}, количество {}, цена {}'.format(
+        art_col, desc_col, qty_col, price_col))
 
     arts, items = set(), []
     for r in range(hdr_row + 1, ws.max_row + 1):
@@ -125,12 +170,21 @@ def read_xlsx_spec(xlsx_path, log):
         qty = ws.cell(r, qty_col).value
         if not qty or any(w in art for w in _ITEM_SKIP):
             continue
+        price = ws.cell(r, price_col).value
+        total = ws.cell(r, total_col).value
+        # "Total EUR" is a formula, and openpyxl only sees a cached result when
+        # Excel itself wrote the file. A missing total is worth computing: it is
+        # used for rows the Pro Forma lacks, where an empty cell means a
+        # position invoiced at nothing.
+        if total in (None, '') and isinstance(qty, (int, float)) \
+                and isinstance(price, (int, float)):
+            total = round(qty * price, 2)
         items.append({
             'article': art,
             'desc':    str(ws.cell(r, desc_col).value or '').strip(),
             'qty':     qty,
-            'price':   ws.cell(r, price_col).value,
-            'total':   ws.cell(r, total_col).value,
+            'price':   price,
+            'total':   total,
         })
     log(f'  ✓ Найдено {len(arts)} артикулов в спецификации')
     log(f'  ✓ XLSX: {len(items)} строк данных')

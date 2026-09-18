@@ -18,6 +18,7 @@ SUITES = [
     ('passport — чтение MRZ паспорта', 'test_passport.py'),
     ('proforma — разбор PDF и сборка DOCX', 'test_proforma.py'),
     ('proforma_pipes — Pro Forma по спецификации', 'test_proforma_pipes.py'),
+    ('processing — спецификация → фактура', 'test_processing.py'),
     ('cmr — накладная из спецификации', 'test_cmr.py'),
     ('bot — маршрутизация всего диалога', 'test_flow.py'),
 ]
